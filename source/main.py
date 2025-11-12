@@ -8,10 +8,20 @@ import argparse
 import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
+from dataclasses import dataclass
+
+@dataclass
+class ToolConfig:
+    log_level: str = 'INFO'
+    json_output: bool = False
+    help: bool = False
+    show_performance: bool = False
+    quiet: bool = False
+    extended: bool = False
+    sockstat_path: str = '/proc/net/sockstat'
 
 class SocketStatsTool:
     def __init__(self):
-        self.sockstat_path = '/proc/net/sockstat'
         self.log_levels = {
             'DEBUG': 0,
             'INFO': 1,
@@ -19,23 +29,42 @@ class SocketStatsTool:
             'ERROR': 3
         }
         
-        self.config = {
-            'log_level': 'INFO',
-            'json_output': False,
-            'help': False,
-            'show_performance': False,
-            'quiet': False,
-            'extended': False
-        }
-        
+        self.config = ToolConfig()
         self.start_time = time.time()
-        self.extended_mode = False
+        self.max_file_size = 10 * 1024 * 1024
+
+        self.protocol_parsers = {
+            'sockets:': self.parse_sockets_section,
+            'TCP:': lambda p, s: self.parse_protocol_section(p, s, 'tcp', {
+                'inuse': 'in_use', 'orphan': 'orphan', 'tw': 'time_wait', 
+                'alloc': 'allocated', 'mem': 'memory'
+            }),
+            'UDP:': lambda p, s: self.parse_protocol_section(p, s, 'udp', {
+                'inuse': 'in_use', 'mem': 'memory'
+            }),
+            'UDPLITE:': lambda p, s: self.parse_protocol_section(p, s, 'udp_lite', {
+                'inuse': 'in_use'
+            }),
+            'RAW:': lambda p, s: self.parse_protocol_section(p, s, 'raw', {
+                'inuse': 'in_use'
+            }),
+            'FRAG:': lambda p, s: self.parse_protocol_section(p, s, 'frag', {
+                'inuse': 'in_use', 'memory': 'memory'
+            }),
+            'TCP6:': lambda p, s: self.parse_protocol_section(p, s, 'tcp6', {
+                'inuse': 'in_use', 'orphan': 'orphan', 'tw': 'time_wait', 
+                'alloc': 'allocated', 'mem': 'memory'
+            }),
+            'UDP6:': lambda p, s: self.parse_protocol_section(p, s, 'udp6', {
+                'inuse': 'in_use', 'mem': 'memory'
+            })
+        }
 
     def run(self):
         try:
             self.parse_command_line()
             
-            if self.config['help']:
+            if self.config.help:
                 self.show_help()
                 sys.exit(0)
             
@@ -44,10 +73,10 @@ class SocketStatsTool:
             
             stats = self.get_socket_stats()
             
-            if not self.config['quiet']:
+            if not self.config.quiet:
                 self.display_stats(stats)
 
-            if self.config['show_performance']:
+            if self.config.show_performance:
                 self.show_performance_metrics()
             
             sys.exit(0)
@@ -70,66 +99,72 @@ class SocketStatsTool:
         args = parser.parse_args()
         
         if args.json:
-            self.config['json_output'] = True
+            self.config.json_output = True
         
         if args.log_level:
-            self.config['log_level'] = args.log_level.upper()
+            self.config.log_level = args.log_level.upper()
         
         if args.help:
-            self.config['help'] = True
+            self.config.help = True
         
         if args.path:
-            self.sockstat_path = args.path
+            self.config.sockstat_path = args.path
         
         if args.performance:
-            self.config['show_performance'] = True
+            self.config.show_performance = True
         
         if args.quiet:
-            self.config['quiet'] = True
+            self.config.quiet = True
         
         if args.extended:
-            self.config['extended'] = True
-            self.extended_mode = True
+            self.config.extended = True
         
         if args.version:
             self.show_version()
             sys.exit(0)
 
     def validate_config(self):
-        if self.config['log_level'] not in self.log_levels:
+        if self.config.log_level not in self.log_levels:
             raise RuntimeError(
-                f"Invalid log level: {self.config['log_level']}. "
+                f"Invalid log level: {self.config.log_level}. "
                 f"Valid levels: {', '.join(self.log_levels.keys())}"
             )
         
-        if '\0' in self.sockstat_path:
+        if '\0' in self.config.sockstat_path:
             raise RuntimeError("Invalid path: contains null byte")
 
     def check_sockstat_file(self):
-        path = Path(self.sockstat_path)
+        path = Path(self.config.sockstat_path)
         
         if path.is_symlink():
             real_path = path.resolve()
             if not real_path.exists():
-                raise RuntimeError(f"Cannot resolve symbolic link: {self.sockstat_path}")
-            self.sockstat_path = str(real_path)
+                raise RuntimeError(f"Cannot resolve symbolic link: {self.config.sockstat_path}")
+            self.config.sockstat_path = str(real_path)
             path = real_path
         
         if not path.exists():
             raise RuntimeError(
-                f"'{self.sockstat_path}' not found. "
+                f"'{self.config.sockstat_path}' not found. "
                 "Ensure you are running on a Linux system or specify --path for an alternate file"
             )
         
-        if not os.access(self.sockstat_path, os.R_OK):
-            raise RuntimeError(f"Cannot read '{self.sockstat_path}'")
+        if not os.access(self.config.sockstat_path, os.R_OK):
+            raise RuntimeError(f"Cannot read '{self.config.sockstat_path}'")
         
         if path.is_dir():
-            raise RuntimeError(f"'{self.sockstat_path}' is a directory, expected a file")
+            raise RuntimeError(f"'{self.config.sockstat_path}' is a directory, expected a file")
+        
+        try:
+            file_size = path.stat().st_size
+            if file_size > self.max_file_size:
+                raise RuntimeError(f"File too large: {self.config.sockstat_path}")
+        except OSError as e:
+            raise RuntimeError(f"Cannot access file stats: {str(e)}")
 
     def log_message(self, level: str, message: str):
         msg_level = self.log_levels.get(level, self.log_levels['INFO'])
-        conf_level = self.log_levels[self.config['log_level']]
+        conf_level = self.log_levels[self.config.log_level]
         
         if msg_level < conf_level:
             return
@@ -137,7 +172,7 @@ class SocketStatsTool:
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         formatted_message = f'[{timestamp}] {level}: {message}'
         
-        if self.config['json_output'] or level == 'ERROR':
+        if self.config.json_output or level == 'ERROR':
             print(formatted_message, file=sys.stderr)
         else:
             print(formatted_message)
@@ -174,11 +209,11 @@ Examples:
         print(help_text)
 
     def get_socket_stats(self) -> Dict[str, Any]:
-        self.log_message('INFO', f"Reading socket statistics from {self.sockstat_path}")
+        self.log_message('INFO', f"Reading socket statistics from {self.config.sockstat_path}")
         
         stats = {
             'metadata': {
-                'source': self.sockstat_path,
+                'source': self.config.sockstat_path,
                 'generated_at': datetime.datetime.now().isoformat(),
                 'hostname': os.uname().nodename if hasattr(os, 'uname') else 'unknown'
             },
@@ -206,11 +241,11 @@ Examples:
             }
         }
 
-        if self.extended_mode:
+        if self.config.extended:
             self.initialize_extended_stats(stats)
         
         try:
-            with open(self.sockstat_path, 'r') as file:
+            with open(self.config.sockstat_path, 'r') as file:
                 line_count = 0
                 for line in file:
                     line = line.strip()
@@ -222,10 +257,14 @@ Examples:
             
             self.log_message('DEBUG', f"Processed {line_count} lines from sockstat file")
             
+        except PermissionError as e:
+            raise RuntimeError(f"Permission denied reading {self.config.sockstat_path}") from e
+        except OSError as e:
+            raise RuntimeError(f"OS error reading {self.config.sockstat_path}: {str(e)}") from e
         except Exception as e:
-            raise RuntimeError(f"Failed to read {self.sockstat_path}: {str(e)}")
+            raise RuntimeError(f"Failed to read {self.config.sockstat_path}: {str(e)}") from e
 
-        if self.extended_mode:
+        if self.config.extended:
             self.load_extended_protocol_info(stats)
         
         return stats
@@ -251,11 +290,11 @@ Examples:
         }
         
         stats['icmp'] = {
-            'inuse': 0
+            'in_use': 0
         }
         
         stats['icmp6'] = {
-            'inuse': 0
+            'in_use': 0
         }
         
         stats['netlink'] = {
@@ -275,58 +314,14 @@ Examples:
         
         section = parts[0]
         
-        if section == 'sockets:':
-            if len(parts) >= 3:
-                stats['sockets_used'] = self.parse_int(parts[2])
-        
-        elif section == 'TCP:':
-            self.parse_protocol_section(parts, stats, 'tcp', {
-                'inuse': 'in_use',
-                'orphan': 'orphan',
-                'tw': 'time_wait',
-                'alloc': 'allocated',
-                'mem': 'memory'
-            })
-        
-        elif section == 'UDP:':
-            self.parse_protocol_section(parts, stats, 'udp', {
-                'inuse': 'in_use',
-                'mem': 'memory'
-            })
-        
-        elif section == 'UDPLITE:':
-            self.parse_protocol_section(parts, stats, 'udp_lite', {
-                'inuse': 'in_use'
-            })
-        
-        elif section == 'RAW:':
-            self.parse_protocol_section(parts, stats, 'raw', {
-                'inuse': 'in_use'
-            })
-        
-        elif section == 'FRAG:':
-            self.parse_protocol_section(parts, stats, 'frag', {
-                'inuse': 'in_use',
-                'memory': 'memory'
-            })
-        
-        elif section == 'TCP6:' and self.extended_mode:
-            self.parse_protocol_section(parts, stats, 'tcp6', {
-                'inuse': 'in_use',
-                'orphan': 'orphan',
-                'tw': 'time_wait',
-                'alloc': 'allocated',
-                'mem': 'memory'
-            })
-        
-        elif section == 'UDP6:' and self.extended_mode:
-            self.parse_protocol_section(parts, stats, 'udp6', {
-                'inuse': 'in_use',
-                'mem': 'memory'
-            })
-        
+        if section in self.protocol_parsers:
+            self.protocol_parsers[section](parts, stats)
         else:
             self.log_message('DEBUG', f"Unknown section: {section}")
+
+    def parse_sockets_section(self, parts: List[str], stats: Dict[str, Any]):
+        if len(parts) >= 3:
+            stats['sockets_used'] = self.parse_int(parts[2])
 
     def load_extended_protocol_info(self, stats: Dict[str, Any]):
         self.load_unix_sockets(stats)
@@ -337,33 +332,20 @@ Examples:
 
     def load_unix_sockets(self, stats: Dict[str, Any]):
         sockstat6_path = '/proc/net/sockstat6'
-        if os.path.exists(sockstat6_path) and os.access(sockstat6_path, os.R_OK):
-            try:
-                with open(sockstat6_path, 'r') as file:
-                    for line in file:
-                        line = line.strip()
-                        if line.startswith('UNIX:'):
-                            parts = line.split()
-                            self.parse_protocol_section(parts, stats, 'unix', {
-                                'inuse': 'in_use',
-                                'dynamic': 'dynamic',
-                                'inode': 'inode'
-                            })
-                            break
-            except Exception as e:
-                self.log_message('DEBUG', f"Could not read UNIX socket info: {str(e)}")
+        self.load_protocol_file(sockstat6_path, 'UNIX:', stats, 'unix', {
+            'inuse': 'in_use', 'dynamic': 'dynamic', 'inode': 'inode'
+        })
 
     def load_netlink_sockets(self, stats: Dict[str, Any]):
         netlink_path = '/proc/net/netlink'
-        if os.path.exists(netlink_path) and os.access(netlink_path, os.R_OK):
+        if self.check_file_access(netlink_path):
             try:
                 with open(netlink_path, 'r') as file:
                     netlink_count = 0
-                    file.readline()  # Skip header
+                    file.readline()
                     
                     for line in file:
-                        line = line.strip()
-                        if line:
+                        if line.strip():
                             netlink_count += 1
                     
                     stats['netlink']['in_use'] = netlink_count
@@ -373,15 +355,14 @@ Examples:
 
     def load_packet_sockets(self, stats: Dict[str, Any]):
         packet_path = '/proc/net/packet'
-        if os.path.exists(packet_path) and os.access(packet_path, os.R_OK):
+        if self.check_file_access(packet_path):
             try:
                 with open(packet_path, 'r') as file:
                     packet_count = 0
-                    file.readline()  # Skip header
+                    file.readline()
                     
                     for line in file:
-                        line = line.strip()
-                        if line:
+                        if line.strip():
                             packet_count += 1
                     
                     stats['packet']['in_use'] = packet_count
@@ -391,7 +372,7 @@ Examples:
 
     def load_icmp_info(self, stats: Dict[str, Any]):
         snmp_path = '/proc/net/snmp'
-        if os.path.exists(snmp_path) and os.access(snmp_path, os.R_OK):
+        if self.check_file_access(snmp_path):
             try:
                 with open(snmp_path, 'r') as file:
                     in_icmp_line = False
@@ -410,13 +391,13 @@ Examples:
                         if in_icmp_line:
                             parts = line.split()
                             if parts:
-                                stats['icmp']['inuse'] = self.parse_int(parts[0])
+                                stats['icmp']['in_use'] = self.parse_int(parts[0])
                             in_icmp_line = False
                         
                         if in_icmp6_line:
                             parts = line.split()
                             if parts:
-                                stats['icmp6']['inuse'] = self.parse_int(parts[0])
+                                stats['icmp6']['in_use'] = self.parse_int(parts[0])
                             in_icmp6_line = False
                     
             except Exception as e:
@@ -424,22 +405,35 @@ Examples:
 
     def load_additional_network_stats(self, stats: Dict[str, Any]):
         netstat_path = '/proc/net/netstat'
-        if os.path.exists(netstat_path) and os.access(netstat_path, os.R_OK):
+        if self.check_file_access(netstat_path):
             try:
                 with open(netstat_path, 'r') as file:
                     for line in file:
                         line = line.strip()
-                        
                         if line.startswith('TcpExt:'):
                             self.parse_tcp_extended_stats(line, stats)
                     
             except Exception as e:
                 self.log_message('DEBUG', f"Could not read extended network stats: {str(e)}")
 
+    def load_protocol_file(self, file_path: str, section: str, stats: Dict[str, Any], 
+                          protocol: str, mapping: Dict[str, str]):
+        if self.check_file_access(file_path):
+            try:
+                with open(file_path, 'r') as file:
+                    for line in file:
+                        line = line.strip()
+                        if line.startswith(section):
+                            parts = line.split()
+                            self.parse_protocol_section(parts, stats, protocol, mapping)
+                            break
+            except Exception as e:
+                self.log_message('DEBUG', f"Could not read {protocol} info: {str(e)}")
+
+    def check_file_access(self, file_path: str) -> bool:
+        return os.path.exists(file_path) and os.access(file_path, os.R_OK)
+
     def parse_tcp_extended_stats(self, line: str, stats: Dict[str, Any]):
-        if not self.extended_mode:
-            return
-        
         parts = line.split()
         if len(parts) < 2:
             return
@@ -455,7 +449,8 @@ Examples:
             
             stats['tcp_ext'][key] = self.parse_int(value)
 
-    def parse_protocol_section(self, parts: List[str], stats: Dict[str, Any], protocol: str, mapping: Dict[str, str]):
+    def parse_protocol_section(self, parts: List[str], stats: Dict[str, Any], 
+                              protocol: str, mapping: Dict[str, str]):
         for i in range(1, len(parts), 2):
             if i + 1 >= len(parts):
                 break
@@ -476,7 +471,7 @@ Examples:
             return 0
 
     def display_stats(self, stats: Dict[str, Any]):
-        if self.config['json_output']:
+        if self.config.json_output:
             self.output_json(stats)
         else:
             self.output_human_readable(stats)
@@ -524,7 +519,7 @@ Examples:
         print(f"  In use:     {stats['frag']['in_use']}")
         print(f"  Memory:     {stats['frag']['memory']} pages")
 
-        if self.extended_mode:
+        if self.config.extended:
             self.output_extended_human_readable(stats)
 
     def output_extended_human_readable(self, stats: Dict[str, Any]):
@@ -532,69 +527,42 @@ Examples:
         print("Extended Protocol Information:")
         print("=============================")
         
-        if 'tcp6' in stats and stats['tcp6']['in_use'] > 0:
-            print("TCP6:")
-            print(f"  In use:     {stats['tcp6']['in_use']}")
-            print(f"  Orphan:     {stats['tcp6']['orphan']}")
-            print(f"  Time wait:  {stats['tcp6']['time_wait']}")
-            print(f"  Allocated:  {stats['tcp6']['allocated']}")
-            print(f"  Memory:     {stats['tcp6']['memory']} pages")
-            print()
+        extended_protocols = [
+            ('tcp6', 'TCP6'), ('udp6', 'UDP6'), ('unix', 'UNIX'),
+            ('netlink', 'Netlink'), ('packet', 'Packet'), 
+            ('icmp', 'ICMP'), ('icmp6', 'ICMP6')
+        ]
         
-        if 'udp6' in stats and stats['udp6']['in_use'] > 0:
-            print("UDP6:")
-            print(f"  In use:     {stats['udp6']['in_use']}")
-            print(f"  Memory:     {stats['udp6']['memory']} pages")
-            print()
-        
-        if 'unix' in stats and stats['unix']['in_use'] > 0:
-            print("UNIX:")
-            print(f"  In use:     {stats['unix']['in_use']}")
-            print(f"  Dynamic:    {stats['unix']['dynamic']}")
-            print(f"  Inode:      {stats['unix']['inode']}")
-            print()
-        
-        if 'netlink' in stats and stats['netlink']['in_use'] > 0:
-            print("Netlink:")
-            print(f"  In use:     {stats['netlink']['in_use']}")
-            print()
-        
-        if 'packet' in stats and stats['packet']['in_use'] > 0:
-            print("Packet:")
-            print(f"  In use:     {stats['packet']['in_use']}")
-            print()
-        
-        if 'icmp' in stats and stats['icmp']['inuse'] > 0:
-            print("ICMP:")
-            print(f"  In use:     {stats['icmp']['inuse']}")
-            print()
-        
-        if 'icmp6' in stats and stats['icmp6']['inuse'] > 0:
-            print("ICMP6:")
-            print(f"  In use:     {stats['icmp6']['inuse']}")
-            print()
+        for protocol_key, protocol_name in extended_protocols:
+            if protocol_key in stats and stats[protocol_key].get('in_use', 0) > 0:
+                print(f"{protocol_name}:")
+                for key, value in stats[protocol_key].items():
+                    print(f"  {key.replace('_', ' ').title():<12} {value}")
+                print()
 
     def show_performance_metrics(self):
         end_time = time.time()
         execution_time = round(end_time - self.start_time, 4)
-        memory_usage = round(sys.getsizeof(self) / 1024 / 1024, 2)
+        
+        import resource
+        memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
         
         metrics = {
             'performance': {
                 'execution_time_seconds': execution_time,
-                'peak_memory_mb': memory_usage,
+                'peak_memory_mb': round(memory_usage, 2),
                 'python_version': f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
             }
         }
         
-        if self.config['json_output']:
+        if self.config.json_output:
             print(json.dumps(metrics, indent=2, ensure_ascii=False))
         else:
             print()
             print("Performance Metrics:")
             print("===================")
             print(f"Execution time: {execution_time}s")
-            print(f"Peak memory:    {memory_usage} MB")
+            print(f"Peak memory:    {metrics['performance']['peak_memory_mb']} MB")
             print(f"Python version: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
 
 def main():
