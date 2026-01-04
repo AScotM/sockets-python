@@ -10,7 +10,7 @@ import resource
 from pathlib import Path
 from enum import Enum
 from typing import Dict, List, Any, Optional, Union
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 class LogLevel(Enum):
     DEBUG = 0
@@ -67,7 +67,7 @@ class SocketStatsTool:
             self.parse_command_line()
             
             if self.config.quiet and (self.config.json_output or self.config.show_performance):
-                print("Warning: --quiet flag is active, but output will still be generated for JSON and performance modes", file=sys.stderr)
+                self.log_message(LogLevel.WARNING, "--quiet flag is active, but output will still be generated for JSON and performance modes")
 
             self.validate_config()
             self.check_sockstat_file()
@@ -85,8 +85,8 @@ class SocketStatsTool:
         except Exception as e:
             self.log_message(LogLevel.ERROR, str(e))
             exit_code = 1
-        finally:
-            sys.exit(exit_code)
+        
+        sys.exit(exit_code)
 
     def parse_command_line(self):
         parser = argparse.ArgumentParser(description='Socket Statistics Tool', add_help=False)
@@ -185,9 +185,9 @@ class SocketStatsTool:
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         formatted_message = f'[{timestamp}] {level.name}: {message}'
         
-        if self.config.json_output or level == LogLevel.ERROR:
+        if level == LogLevel.ERROR:
             print(formatted_message, file=sys.stderr)
-        else:
+        elif not self.config.json_output:
             print(formatted_message)
 
     def show_version(self):
@@ -336,7 +336,9 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
 
     def parse_sockets_section(self, parts: List[str], stats: Dict[str, Any]):
         if len(parts) >= 3:
-            stats['sockets_used'] = self.parse_int(parts[2])
+            parsed_value = self.parse_int(parts[2])
+            if parsed_value is not None:
+                stats['sockets_used'] = parsed_value
 
     def load_extended_protocol_info(self, stats: Dict[str, Any]):
         self.load_unix_sockets(stats)
@@ -417,13 +419,17 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
                         if in_icmp_line:
                             parts = line.split()
                             if parts:
-                                stats['icmp']['in_use'] = self.parse_int(parts[0])
+                                parsed_value = self.parse_int(parts[0])
+                                if parsed_value is not None:
+                                    stats['icmp']['in_use'] = parsed_value
                             in_icmp_line = False
                         
                         if in_icmp6_line:
                             parts = line.split()
                             if parts:
-                                stats['icmp6']['in_use'] = self.parse_int(parts[0])
+                                parsed_value = self.parse_int(parts[0])
+                                if parsed_value is not None:
+                                    stats['icmp6']['in_use'] = parsed_value
                             in_icmp6_line = False
                     
             except Exception as e:
@@ -451,7 +457,8 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
         if len(parts) < 2:
             return
         
-        stats['tcp_ext'] = {}
+        if 'tcp_ext' not in stats:
+            stats['tcp_ext'] = {}
         
         for i in range(1, len(parts), 2):
             if i + 1 >= len(parts):
@@ -460,7 +467,9 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
             key = parts[i]
             value = parts[i + 1]
             
-            stats['tcp_ext'][key] = self.parse_int(value)
+            parsed_value = self.parse_int(value)
+            if parsed_value is not None:
+                stats['tcp_ext'][key] = parsed_value
 
     def parse_protocol_section(self, parts: List[str], stats: Dict[str, Any], 
                               protocol: str, mapping: Dict[str, str]):
@@ -472,7 +481,9 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
             value = parts[i + 1]
             
             if key in mapping:
-                stats[protocol][mapping[key]] = self.parse_int(value)
+                parsed_value = self.parse_int(value)
+                if parsed_value is not None:
+                    stats[protocol][mapping[key]] = parsed_value
             else:
                 self.log_message(LogLevel.DEBUG, f"Unknown {protocol} field: {key}")
 
@@ -493,7 +504,7 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
                 self.log_message(LogLevel.INFO, f"Output written to {self.config.output_file}")
             except Exception as e:
                 raise RuntimeError(f"Failed to write output to {self.config.output_file}: {str(e)}")
-        else:
+        elif not self.config.quiet:
             print(output)
 
     def generate_output(self, stats: Dict[str, Any]) -> str:
@@ -531,14 +542,16 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
         ]
         
         for protocol_key, protocol_name in protocols:
-            if protocol_key in stats and any(stats[protocol_key].values()):
-                lines.append(f"{protocol_name}:")
-                for key, value in stats[protocol_key].items():
-                    if value is not None:
-                        display_key = key.replace('_', ' ').title()
-                        suffix = ' pages' if key == 'memory' else ''
-                        lines.append(f"  {display_key:<12} {value}{suffix}")
-                lines.append("")
+            if protocol_key in stats:
+                has_values = any(value is not None for value in stats[protocol_key].values())
+                if has_values:
+                    lines.append(f"{protocol_name}:")
+                    for key, value in stats[protocol_key].items():
+                        if value is not None:
+                            display_key = key.replace('_', ' ').title()
+                            suffix = ' pages' if key == 'memory' else ''
+                            lines.append(f"  {display_key:<12} {value}{suffix}")
+                    lines.append("")
 
         if self.config.extended:
             lines.extend(self.generate_extended_human_readable_output(stats))
@@ -559,14 +572,16 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
         ]
         
         for protocol_key, protocol_name in extended_protocols:
-            if protocol_key in stats and stats[protocol_key].get('in_use', 0) > 0:
-                lines.append(f"{protocol_name}:")
-                for key, value in stats[protocol_key].items():
-                    if value is not None:
-                        lines.append(f"  {key.replace('_', ' ').title():<12} {value}")
-                lines.append("")
+            if protocol_key in stats:
+                in_use_value = stats[protocol_key].get('in_use')
+                if in_use_value is not None and in_use_value > 0:
+                    lines.append(f"{protocol_name}:")
+                    for key, value in stats[protocol_key].items():
+                        if value is not None:
+                            lines.append(f"  {key.replace('_', ' ').title():<12} {value}")
+                    lines.append("")
         
-        if 'tcp_ext' in stats:
+        if 'tcp_ext' in stats and stats['tcp_ext']:
             lines.append("TCP Extended Statistics:")
             lines.append("-----------------------")
             for key, value in stats['tcp_ext'].items():
@@ -592,11 +607,14 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
             }
         }
         
-        output = json.dumps(metrics, indent=2, ensure_ascii=False) if self.config.json_output else self.generate_performance_human_readable(metrics)
+        if self.config.json_output:
+            output = json.dumps(metrics, indent=2, ensure_ascii=False)
+        else:
+            output = self.generate_performance_human_readable(metrics)
         
         if self.config.output_file and self.config.json_output:
-            print("Performance metrics are included in the main JSON output")
-        else:
+            self.log_message(LogLevel.INFO, "Performance metrics are included in the main JSON output")
+        elif not self.config.quiet:
             print(output)
 
     def generate_performance_human_readable(self, metrics: Dict[str, Any]) -> str:
@@ -611,7 +629,7 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
 
 def main():
     if not sys.stdin.isatty() and len(sys.argv) == 1:
-        print("This script must be run from the command line with arguments.")
+        print("This script must be run from the command line with arguments.", file=sys.stderr)
         sys.exit(1)
     
     app = SocketStatsTool()
