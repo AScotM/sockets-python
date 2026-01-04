@@ -6,29 +6,30 @@ import json
 import time
 import argparse
 import datetime
+import resource
 from pathlib import Path
-from typing import Dict, List, Any, Optional
-from dataclasses import dataclass
+from enum import Enum
+from typing import Dict, List, Any, Optional, Union
+from dataclasses import dataclass, field
+
+class LogLevel(Enum):
+    DEBUG = 0
+    INFO = 1
+    WARNING = 2
+    ERROR = 3
 
 @dataclass
 class ToolConfig:
-    log_level: str = 'INFO'
+    log_level: LogLevel = LogLevel.INFO
     json_output: bool = False
-    help: bool = False
     show_performance: bool = False
     quiet: bool = False
     extended: bool = False
     sockstat_path: str = '/proc/net/sockstat'
+    output_file: Optional[str] = None
 
 class SocketStatsTool:
     def __init__(self):
-        self.log_levels = {
-            'DEBUG': 0,
-            'INFO': 1,
-            'WARNING': 2,
-            'ERROR': 3
-        }
-        
         self.config = ToolConfig()
         self.start_time = time.time()
         self.max_file_size = 10 * 1024 * 1024
@@ -61,13 +62,13 @@ class SocketStatsTool:
         }
 
     def run(self):
+        exit_code = 0
         try:
             self.parse_command_line()
             
-            if self.config.help:
-                self.show_help()
-                sys.exit(0)
-            
+            if self.config.quiet and (self.config.json_output or self.config.show_performance):
+                print("Warning: --quiet flag is active, but output will still be generated for JSON and performance modes", file=sys.stderr)
+
             self.validate_config()
             self.check_sockstat_file()
             
@@ -79,11 +80,13 @@ class SocketStatsTool:
             if self.config.show_performance:
                 self.show_performance_metrics()
             
-            sys.exit(0)
-            
+        except SystemExit:
+            raise
         except Exception as e:
-            self.log_message('ERROR', str(e))
-            sys.exit(1)
+            self.log_message(LogLevel.ERROR, str(e))
+            exit_code = 1
+        finally:
+            sys.exit(exit_code)
 
     def parse_command_line(self):
         parser = argparse.ArgumentParser(description='Socket Statistics Tool', add_help=False)
@@ -95,17 +98,26 @@ class SocketStatsTool:
         parser.add_argument('--quiet', action='store_true', help='Suppress all non-error output')
         parser.add_argument('--extended', action='store_true', help='Show extended protocol information')
         parser.add_argument('--version', action='store_true', help='Display version information')
+        parser.add_argument('--output', type=str, help='Write output to specified file')
+        parser.add_argument('--verbose', action='store_true', help='Enable verbose output (same as --log-level DEBUG)')
         
         args = parser.parse_args()
         
         if args.json:
             self.config.json_output = True
         
-        if args.log_level:
-            self.config.log_level = args.log_level.upper()
+        if args.verbose:
+            self.config.log_level = LogLevel.DEBUG
+        elif args.log_level:
+            try:
+                self.config.log_level = LogLevel[args.log_level.upper()]
+            except KeyError:
+                valid_levels = ', '.join([level.name for level in LogLevel])
+                raise RuntimeError(f"Invalid log level: {args.log_level}. Valid levels: {valid_levels}")
         
         if args.help:
-            self.config.help = True
+            self.show_help()
+            sys.exit(0)
         
         if args.path:
             self.config.sockstat_path = args.path
@@ -119,19 +131,23 @@ class SocketStatsTool:
         if args.extended:
             self.config.extended = True
         
+        if args.output:
+            self.config.output_file = args.output
+        
         if args.version:
-            self.show_version()
+            if not args.quiet:
+                self.show_version()
             sys.exit(0)
 
     def validate_config(self):
-        if self.config.log_level not in self.log_levels:
-            raise RuntimeError(
-                f"Invalid log level: {self.config.log_level}. "
-                f"Valid levels: {', '.join(self.log_levels.keys())}"
-            )
+        if not isinstance(self.config.log_level, LogLevel):
+            raise RuntimeError(f"Invalid log level configuration")
         
-        if '\0' in self.config.sockstat_path:
-            raise RuntimeError("Invalid path: contains null byte")
+        if '\0' in self.config.sockstat_path or '..' in self.config.sockstat_path:
+            raise RuntimeError("Invalid path: potential path traversal attack detected")
+        
+        if self.config.output_file and ('\0' in self.config.output_file or '..' in self.config.output_file):
+            raise RuntimeError("Invalid output file path: potential path traversal attack detected")
 
     def check_sockstat_file(self):
         path = Path(self.config.sockstat_path)
@@ -158,41 +174,40 @@ class SocketStatsTool:
         try:
             file_size = path.stat().st_size
             if file_size > self.max_file_size:
-                raise RuntimeError(f"File too large: {self.config.sockstat_path}")
+                self.log_message(LogLevel.WARNING, f"File size {file_size} exceeds threshold {self.max_file_size}")
         except OSError as e:
             raise RuntimeError(f"Cannot access file stats: {str(e)}")
 
-    def log_message(self, level: str, message: str):
-        msg_level = self.log_levels.get(level, self.log_levels['INFO'])
-        conf_level = self.log_levels[self.config.log_level]
-        
-        if msg_level < conf_level:
+    def log_message(self, level: LogLevel, message: str):
+        if level.value < self.config.log_level.value:
             return
         
         timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        formatted_message = f'[{timestamp}] {level}: {message}'
+        formatted_message = f'[{timestamp}] {level.name}: {message}'
         
-        if self.config.json_output or level == 'ERROR':
+        if self.config.json_output or level == LogLevel.ERROR:
             print(formatted_message, file=sys.stderr)
         else:
             print(formatted_message)
 
     def show_version(self):
-        print("Socket Statistics Tool 1.1.0")
+        print("Socket Statistics Tool 1.2.0")
         print(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
 
     def show_help(self):
-        help_text = """Socket Statistics Tool 1.1.0
+        help_text = """Socket Statistics Tool 1.2.0
 
 Usage: socket_stats.py [OPTIONS]
 
 Options:
   --json                 Output socket summary in JSON format
   --log-level LEVEL      Set log level (DEBUG, INFO, WARNING, ERROR)
+  --verbose              Enable verbose output (same as --log-level DEBUG)
   --path PATH            Path to sockstat file (default: /proc/net/sockstat)
   --performance          Show performance metrics
   --quiet                Suppress all non-error output
   --extended             Show extended protocol information
+  --output FILE          Write output to specified file
   --version              Display version information
   --help                 Display this help message
 
@@ -203,13 +218,15 @@ Examples:
   socket_stats.py --path /tmp/test-sockstat --json
   socket_stats.py --performance --json
   socket_stats.py --quiet --json
-  socket_stats.py --extended --json
+  socket_stats.py --extended --json --output results.json
+
+Note: The --quiet flag suppresses regular output but not JSON output or error messages.
 
 """
         print(help_text)
 
     def get_socket_stats(self) -> Dict[str, Any]:
-        self.log_message('INFO', f"Reading socket statistics from {self.config.sockstat_path}")
+        self.log_message(LogLevel.INFO, f"Reading socket statistics from {self.config.sockstat_path}")
         
         stats = {
             'metadata': {
@@ -225,7 +242,18 @@ Examples:
                 'allocated': 0,
                 'memory': 0
             },
+            'tcp6': {
+                'in_use': 0,
+                'orphan': 0,
+                'time_wait': 0,
+                'allocated': 0,
+                'memory': 0
+            },
             'udp': {
+                'in_use': 0,
+                'memory': 0
+            },
+            'udp6': {
                 'in_use': 0,
                 'memory': 0
             },
@@ -252,10 +280,10 @@ Examples:
                     if not line:
                         continue
                     
-                    self.parse_line(line, stats)
+                    self.parse_sockstat_line(line, stats)
                     line_count += 1
             
-            self.log_message('DEBUG', f"Processed {line_count} lines from sockstat file")
+            self.log_message(LogLevel.DEBUG, f"Processed {line_count} lines from sockstat file")
             
         except PermissionError as e:
             raise RuntimeError(f"Permission denied reading {self.config.sockstat_path}") from e
@@ -270,19 +298,6 @@ Examples:
         return stats
 
     def initialize_extended_stats(self, stats: Dict[str, Any]):
-        stats['tcp6'] = {
-            'in_use': 0,
-            'orphan': 0,
-            'time_wait': 0,
-            'allocated': 0,
-            'memory': 0
-        }
-        
-        stats['udp6'] = {
-            'in_use': 0,
-            'memory': 0
-        }
-        
         stats['unix'] = {
             'in_use': 0,
             'dynamic': 0,
@@ -306,10 +321,10 @@ Examples:
             'memory': 0
         }
 
-    def parse_line(self, line: str, stats: Dict[str, Any]):
+    def parse_sockstat_line(self, line: str, stats: Dict[str, Any]):
         parts = line.split()
         if len(parts) < 2:
-            self.log_message('DEBUG', f"Skipping malformed line: {line}")
+            self.log_message(LogLevel.DEBUG, f"Skipping malformed line: {line}")
             return
         
         section = parts[0]
@@ -317,7 +332,7 @@ Examples:
         if section in self.protocol_parsers:
             self.protocol_parsers[section](parts, stats)
         else:
-            self.log_message('DEBUG', f"Unknown section: {section}")
+            self.log_message(LogLevel.DEBUG, f"Unknown section: {section}")
 
     def parse_sockets_section(self, parts: List[str], stats: Dict[str, Any]):
         if len(parts) >= 3:
@@ -331,10 +346,21 @@ Examples:
         self.load_additional_network_stats(stats)
 
     def load_unix_sockets(self, stats: Dict[str, Any]):
-        sockstat6_path = '/proc/net/sockstat6'
-        self.load_protocol_file(sockstat6_path, 'UNIX:', stats, 'unix', {
-            'inuse': 'in_use', 'dynamic': 'dynamic', 'inode': 'inode'
-        })
+        unix_path = '/proc/net/unix'
+        if self.check_file_access(unix_path):
+            try:
+                with open(unix_path, 'r') as file:
+                    unix_count = 0
+                    file.readline()
+                    
+                    for line in file:
+                        if line.strip():
+                            unix_count += 1
+                    
+                    stats['unix']['in_use'] = unix_count
+                    
+            except Exception as e:
+                self.log_message(LogLevel.DEBUG, f"Could not read UNIX socket info: {str(e)}")
 
     def load_netlink_sockets(self, stats: Dict[str, Any]):
         netlink_path = '/proc/net/netlink'
@@ -351,7 +377,7 @@ Examples:
                     stats['netlink']['in_use'] = netlink_count
                     
             except Exception as e:
-                self.log_message('DEBUG', f"Could not read netlink socket info: {str(e)}")
+                self.log_message(LogLevel.DEBUG, f"Could not read netlink socket info: {str(e)}")
 
     def load_packet_sockets(self, stats: Dict[str, Any]):
         packet_path = '/proc/net/packet'
@@ -368,7 +394,7 @@ Examples:
                     stats['packet']['in_use'] = packet_count
                     
             except Exception as e:
-                self.log_message('DEBUG', f"Could not read packet socket info: {str(e)}")
+                self.log_message(LogLevel.DEBUG, f"Could not read packet socket info: {str(e)}")
 
     def load_icmp_info(self, stats: Dict[str, Any]):
         snmp_path = '/proc/net/snmp'
@@ -401,7 +427,7 @@ Examples:
                             in_icmp6_line = False
                     
             except Exception as e:
-                self.log_message('DEBUG', f"Could not read ICMP info: {str(e)}")
+                self.log_message(LogLevel.DEBUG, f"Could not read ICMP info: {str(e)}")
 
     def load_additional_network_stats(self, stats: Dict[str, Any]):
         netstat_path = '/proc/net/netstat'
@@ -414,24 +440,11 @@ Examples:
                             self.parse_tcp_extended_stats(line, stats)
                     
             except Exception as e:
-                self.log_message('DEBUG', f"Could not read extended network stats: {str(e)}")
-
-    def load_protocol_file(self, file_path: str, section: str, stats: Dict[str, Any], 
-                          protocol: str, mapping: Dict[str, str]):
-        if self.check_file_access(file_path):
-            try:
-                with open(file_path, 'r') as file:
-                    for line in file:
-                        line = line.strip()
-                        if line.startswith(section):
-                            parts = line.split()
-                            self.parse_protocol_section(parts, stats, protocol, mapping)
-                            break
-            except Exception as e:
-                self.log_message('DEBUG', f"Could not read {protocol} info: {str(e)}")
+                self.log_message(LogLevel.DEBUG, f"Could not read extended network stats: {str(e)}")
 
     def check_file_access(self, file_path: str) -> bool:
-        return os.path.exists(file_path) and os.access(file_path, os.R_OK)
+        path = Path(file_path)
+        return path.exists() and os.access(file_path, os.R_OK)
 
     def parse_tcp_extended_stats(self, line: str, stats: Dict[str, Any]):
         parts = line.split()
@@ -461,113 +474,144 @@ Examples:
             if key in mapping:
                 stats[protocol][mapping[key]] = self.parse_int(value)
             else:
-                self.log_message('DEBUG', f"Unknown {protocol} field: {key}")
+                self.log_message(LogLevel.DEBUG, f"Unknown {protocol} field: {key}")
 
-    def parse_int(self, value: str) -> int:
+    def parse_int(self, value: str) -> Optional[int]:
         try:
             return int(value)
         except ValueError:
-            self.log_message('WARNING', f"Failed to parse integer: '{value}'")
-            return 0
+            self.log_message(LogLevel.WARNING, f"Failed to parse integer: '{value}'")
+            return None
 
     def display_stats(self, stats: Dict[str, Any]):
-        if self.config.json_output:
-            self.output_json(stats)
+        output = self.generate_output(stats)
+        
+        if self.config.output_file:
+            try:
+                with open(self.config.output_file, 'w') as f:
+                    f.write(output)
+                self.log_message(LogLevel.INFO, f"Output written to {self.config.output_file}")
+            except Exception as e:
+                raise RuntimeError(f"Failed to write output to {self.config.output_file}: {str(e)}")
         else:
-            self.output_human_readable(stats)
+            print(output)
 
-    def output_json(self, stats: Dict[str, Any]):
+    def generate_output(self, stats: Dict[str, Any]) -> str:
+        if self.config.json_output:
+            return self.generate_json_output(stats)
+        else:
+            return self.generate_human_readable_output(stats)
+
+    def generate_json_output(self, stats: Dict[str, Any]) -> str:
         try:
-            json_data = json.dumps(stats, indent=2, ensure_ascii=False)
-            print(json_data)
+            return json.dumps(stats, indent=2, ensure_ascii=False)
         except Exception as e:
             raise RuntimeError(f'Failed to encode JSON: {str(e)}')
 
-    def output_human_readable(self, stats: Dict[str, Any]):
-        print("Socket Statistics")
-        print("=================")
-        print(f"Generated: {stats['metadata']['generated_at']}")
-        print(f"Hostname:  {stats['metadata']['hostname']}")
-        print(f"Source:    {stats['metadata']['source']}")
-        print()
+    def generate_human_readable_output(self, stats: Dict[str, Any]) -> str:
+        lines = []
+        lines.append("Socket Statistics")
+        lines.append("=================")
+        lines.append(f"Generated: {stats['metadata']['generated_at']}")
+        lines.append(f"Hostname:  {stats['metadata']['hostname']}")
+        lines.append(f"Source:    {stats['metadata']['source']}")
+        lines.append("")
         
-        print(f"Sockets used: {stats['sockets_used']}")
-        print()
+        lines.append(f"Sockets used: {stats['sockets_used']}")
+        lines.append("")
         
-        print("TCP:")
-        print(f"  In use:     {stats['tcp']['in_use']}")
-        print(f"  Orphan:     {stats['tcp']['orphan']}")
-        print(f"  Time wait:  {stats['tcp']['time_wait']}")
-        print(f"  Allocated:  {stats['tcp']['allocated']}")
-        print(f"  Memory:     {stats['tcp']['memory']} pages")
-        print()
+        protocols = [
+            ('tcp', 'TCP'),
+            ('tcp6', 'TCP6'),
+            ('udp', 'UDP'),
+            ('udp6', 'UDP6'),
+            ('udp_lite', 'UDPLite'),
+            ('raw', 'RAW'),
+            ('frag', 'FRAG')
+        ]
         
-        print("UDP:")
-        print(f"  In use:     {stats['udp']['in_use']}")
-        print(f"  Memory:     {stats['udp']['memory']} pages")
-        print()
-        
-        print("UDPLite:")
-        print(f"  In use:     {stats['udp_lite']['in_use']}")
-        print()
-        
-        print("RAW:")
-        print(f"  In use:     {stats['raw']['in_use']}")
-        print()
-        
-        print("FRAG:")
-        print(f"  In use:     {stats['frag']['in_use']}")
-        print(f"  Memory:     {stats['frag']['memory']} pages")
+        for protocol_key, protocol_name in protocols:
+            if protocol_key in stats and any(stats[protocol_key].values()):
+                lines.append(f"{protocol_name}:")
+                for key, value in stats[protocol_key].items():
+                    if value is not None:
+                        display_key = key.replace('_', ' ').title()
+                        suffix = ' pages' if key == 'memory' else ''
+                        lines.append(f"  {display_key:<12} {value}{suffix}")
+                lines.append("")
 
         if self.config.extended:
-            self.output_extended_human_readable(stats)
+            lines.extend(self.generate_extended_human_readable_output(stats))
+        
+        return '\n'.join(lines)
 
-    def output_extended_human_readable(self, stats: Dict[str, Any]):
-        print()
-        print("Extended Protocol Information:")
-        print("=============================")
+    def generate_extended_human_readable_output(self, stats: Dict[str, Any]) -> List[str]:
+        lines = []
+        lines.append("Extended Protocol Information:")
+        lines.append("=============================")
         
         extended_protocols = [
-            ('tcp6', 'TCP6'), ('udp6', 'UDP6'), ('unix', 'UNIX'),
-            ('netlink', 'Netlink'), ('packet', 'Packet'), 
-            ('icmp', 'ICMP'), ('icmp6', 'ICMP6')
+            ('unix', 'UNIX'),
+            ('netlink', 'Netlink'),
+            ('packet', 'Packet'), 
+            ('icmp', 'ICMP'),
+            ('icmp6', 'ICMP6')
         ]
         
         for protocol_key, protocol_name in extended_protocols:
             if protocol_key in stats and stats[protocol_key].get('in_use', 0) > 0:
-                print(f"{protocol_name}:")
+                lines.append(f"{protocol_name}:")
                 for key, value in stats[protocol_key].items():
-                    print(f"  {key.replace('_', ' ').title():<12} {value}")
-                print()
+                    if value is not None:
+                        lines.append(f"  {key.replace('_', ' ').title():<12} {value}")
+                lines.append("")
+        
+        if 'tcp_ext' in stats:
+            lines.append("TCP Extended Statistics:")
+            lines.append("-----------------------")
+            for key, value in stats['tcp_ext'].items():
+                if value is not None:
+                    lines.append(f"  {key:<20} {value}")
+            lines.append("")
+        
+        return lines
 
     def show_performance_metrics(self):
         end_time = time.time()
         execution_time = round(end_time - self.start_time, 4)
         
-        import resource
-        memory_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        memory_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        memory_mb = memory_kb / 1024.0
         
         metrics = {
             'performance': {
                 'execution_time_seconds': execution_time,
-                'peak_memory_mb': round(memory_usage, 2),
+                'peak_memory_mb': round(memory_mb, 2),
+                'peak_memory_kb': memory_kb,
                 'python_version': f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
             }
         }
         
-        if self.config.json_output:
-            print(json.dumps(metrics, indent=2, ensure_ascii=False))
+        output = json.dumps(metrics, indent=2, ensure_ascii=False) if self.config.json_output else self.generate_performance_human_readable(metrics)
+        
+        if self.config.output_file and self.config.json_output:
+            print("Performance metrics are included in the main JSON output")
         else:
-            print()
-            print("Performance Metrics:")
-            print("===================")
-            print(f"Execution time: {execution_time}s")
-            print(f"Peak memory:    {metrics['performance']['peak_memory_mb']} MB")
-            print(f"Python version: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+            print(output)
+
+    def generate_performance_human_readable(self, metrics: Dict[str, Any]) -> str:
+        lines = []
+        lines.append("")
+        lines.append("Performance Metrics:")
+        lines.append("===================")
+        lines.append(f"Execution time: {metrics['performance']['execution_time_seconds']}s")
+        lines.append(f"Peak memory:    {metrics['performance']['peak_memory_mb']} MB")
+        lines.append(f"Python version: {metrics['performance']['python_version']}")
+        return '\n'.join(lines)
 
 def main():
-    if not sys.stdin.isatty():
-        print("This script must be run from the command line.")
+    if not sys.stdin.isatty() and len(sys.argv) == 1:
+        print("This script must be run from the command line with arguments.")
         sys.exit(1)
     
     app = SocketStatsTool()
