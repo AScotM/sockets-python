@@ -9,7 +9,7 @@ import datetime
 import resource
 from pathlib import Path
 from enum import Enum
-from typing import Dict, List, Any, Optional, Union
+from typing import Dict, List, Any, Optional, Union, Callable
 from dataclasses import dataclass
 
 class LogLevel(Enum):
@@ -29,12 +29,19 @@ class ToolConfig:
     output_file: Optional[str] = None
 
 class SocketStatsTool:
-    def __init__(self):
+    def __init__(self) -> None:
         self.config = ToolConfig()
         self.start_time = time.time()
         self.max_file_size = 10 * 1024 * 1024
+        self.max_line_length = 1024 * 1024
+        self.allowed_proc_dirs = [
+            Path('/proc/net').resolve(),
+            Path('/proc').resolve(),
+            Path('/tmp/socket-stats').resolve() if Path('/tmp/socket-stats').exists() else None
+        ]
+        self.allowed_proc_dirs = [d for d in self.allowed_proc_dirs if d is not None]
 
-        self.protocol_parsers = {
+        self.protocol_parsers: Dict[str, Callable] = {
             'sockets:': self.parse_sockets_section,
             'TCP:': lambda p, s: self.parse_protocol_section(p, s, 'tcp', {
                 'inuse': 'in_use', 'orphan': 'orphan', 'tw': 'time_wait', 
@@ -55,13 +62,15 @@ class SocketStatsTool:
             'TCP6:': lambda p, s: self.parse_protocol_section(p, s, 'tcp6', {
                 'inuse': 'in_use', 'orphan': 'orphan', 'tw': 'time_wait', 
                 'alloc': 'allocated', 'mem': 'memory'
-            }),
+            }) if self.config.extended else None,
             'UDP6:': lambda p, s: self.parse_protocol_section(p, s, 'udp6', {
                 'inuse': 'in_use', 'mem': 'memory'
-            })
+            }) if self.config.extended else None
         }
+        
+        self.protocol_parsers = {k: v for k, v in self.protocol_parsers.items() if v is not None}
 
-    def run(self):
+    def run(self) -> None:
         exit_code = 0
         try:
             self.parse_command_line()
@@ -88,7 +97,7 @@ class SocketStatsTool:
         
         sys.exit(exit_code)
 
-    def parse_command_line(self):
+    def parse_command_line(self) -> None:
         parser = argparse.ArgumentParser(description='Socket Statistics Tool', add_help=False)
         parser.add_argument('--json', action='store_true', help='Output socket summary in JSON format')
         parser.add_argument('--log-level', type=str, help='Set log level (DEBUG, INFO, WARNING, ERROR)')
@@ -120,7 +129,7 @@ class SocketStatsTool:
             sys.exit(0)
         
         if args.path:
-            self.config.sockstat_path = args.path
+            self.config.sockstat_path = self.sanitize_path(args.path)
         
         if args.performance:
             self.config.show_performance = True
@@ -132,32 +141,68 @@ class SocketStatsTool:
             self.config.extended = True
         
         if args.output:
-            self.config.output_file = args.output
+            self.config.output_file = self.sanitize_path(args.output)
         
         if args.version:
             if not args.quiet:
                 self.show_version()
             sys.exit(0)
 
-    def validate_config(self):
+    def sanitize_path(self, path: str) -> str:
+        path = path.replace('\0', '')
+        path = os.path.normpath(path)
+        
+        if '..' in path.split(os.sep):
+            raise RuntimeError("Path traversal detected in path")
+        
+        return path
+
+    def is_path_allowed(self, path: Path) -> bool:
+        try:
+            resolved_path = path.resolve()
+        except (RuntimeError, OSError):
+            return False
+        
+        for allowed_dir in self.allowed_proc_dirs:
+            if allowed_dir in resolved_path.parents or resolved_path == allowed_dir:
+                return True
+        
+        return False
+
+    def validate_config(self) -> None:
         if not isinstance(self.config.log_level, LogLevel):
             raise RuntimeError(f"Invalid log level configuration")
         
-        if '\0' in self.config.sockstat_path or '..' in self.config.sockstat_path:
+        if '\0' in self.config.sockstat_path or '..' in self.config.sockstat_path.split(os.sep):
             raise RuntimeError("Invalid path: potential path traversal attack detected")
         
-        if self.config.output_file and ('\0' in self.config.output_file or '..' in self.config.output_file):
-            raise RuntimeError("Invalid output file path: potential path traversal attack detected")
+        if self.config.output_file:
+            if '\0' in self.config.output_file or '..' in self.config.output_file.split(os.sep):
+                raise RuntimeError("Invalid output file path: potential path traversal attack detected")
+            
+            output_dir = Path(self.config.output_file).parent
+            if not output_dir.exists():
+                raise RuntimeError(f"Output directory does not exist: {output_dir}")
+            
+            if not os.access(str(output_dir), os.W_OK):
+                raise RuntimeError(f"Output directory is not writable: {output_dir}")
 
-    def check_sockstat_file(self):
+    def check_sockstat_file(self) -> None:
         path = Path(self.config.sockstat_path)
         
         if path.is_symlink():
             real_path = path.resolve()
             if not real_path.exists():
                 raise RuntimeError(f"Cannot resolve symbolic link: {self.config.sockstat_path}")
+            
+            if not self.is_path_allowed(real_path):
+                raise RuntimeError(f"Symbolic link target not allowed: {real_path}")
+            
             self.config.sockstat_path = str(real_path)
             path = real_path
+        
+        if not self.is_path_allowed(path):
+            raise RuntimeError(f"Path not allowed: {self.config.sockstat_path}")
         
         if not path.exists():
             raise RuntimeError(
@@ -165,7 +210,7 @@ class SocketStatsTool:
                 "Ensure you are running on a Linux system or specify --path for an alternate file"
             )
         
-        if not os.access(self.config.sockstat_path, os.R_OK):
+        if not os.access(str(path), os.R_OK):
             raise RuntimeError(f"Cannot read '{self.config.sockstat_path}'")
         
         if path.is_dir():
@@ -178,7 +223,29 @@ class SocketStatsTool:
         except OSError as e:
             raise RuntimeError(f"Cannot access file stats: {str(e)}")
 
-    def log_message(self, level: LogLevel, message: str):
+    def safe_open_file(self, file_path: str, mode: str = 'r'):
+        path = Path(file_path)
+        
+        if not self.is_path_allowed(path):
+            raise RuntimeError(f"Path not allowed: {file_path}")
+        
+        if not path.exists():
+            return None
+        
+        if not os.access(str(path), os.R_OK):
+            return None
+        
+        try:
+            file_size = path.stat().st_size
+            if file_size > self.max_file_size:
+                self.log_message(LogLevel.WARNING, f"File size {file_size} exceeds threshold {self.max_file_size}")
+                return None
+        except OSError:
+            return None
+        
+        return open(str(path), mode)
+
+    def log_message(self, level: LogLevel, message: str) -> None:
         if level.value < self.config.log_level.value:
             return
         
@@ -190,11 +257,11 @@ class SocketStatsTool:
         elif not self.config.json_output:
             print(formatted_message)
 
-    def show_version(self):
+    def show_version(self) -> None:
         print("Socket Statistics Tool 1.2.0")
         print(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
 
-    def show_help(self):
+    def show_help(self) -> None:
         help_text = """Socket Statistics Tool 1.2.0
 
 Usage: socket_stats.py [OPTIONS]
@@ -225,6 +292,24 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
 """
         print(help_text)
 
+    def read_file_lines(self, file_path: str) -> List[str]:
+        lines = []
+        file_obj = self.safe_open_file(file_path)
+        if not file_obj:
+            return lines
+        
+        try:
+            with file_obj as f:
+                for line in f:
+                    if len(line) > self.max_line_length:
+                        self.log_message(LogLevel.WARNING, f"Line exceeds maximum length in {file_path}, skipping")
+                        continue
+                    lines.append(line.rstrip('\n'))
+        except Exception as e:
+            self.log_message(LogLevel.DEBUG, f"Error reading {file_path}: {str(e)}")
+        
+        return lines
+
     def get_socket_stats(self) -> Dict[str, Any]:
         self.log_message(LogLevel.INFO, f"Reading socket statistics from {self.config.sockstat_path}")
         
@@ -242,18 +327,7 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
                 'allocated': 0,
                 'memory': 0
             },
-            'tcp6': {
-                'in_use': 0,
-                'orphan': 0,
-                'time_wait': 0,
-                'allocated': 0,
-                'memory': 0
-            },
             'udp': {
-                'in_use': 0,
-                'memory': 0
-            },
-            'udp6': {
                 'in_use': 0,
                 'memory': 0
             },
@@ -271,24 +345,32 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
 
         if self.config.extended:
             self.initialize_extended_stats(stats)
+            stats['tcp6'] = {
+                'in_use': 0,
+                'orphan': 0,
+                'time_wait': 0,
+                'allocated': 0,
+                'memory': 0
+            }
+            stats['udp6'] = {
+                'in_use': 0,
+                'memory': 0
+            }
         
         try:
-            with open(self.config.sockstat_path, 'r') as file:
-                line_count = 0
-                for line in file:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    
-                    self.parse_sockstat_line(line, stats)
-                    line_count += 1
+            lines = self.read_file_lines(self.config.sockstat_path)
+            line_count = 0
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                self.parse_sockstat_line(line, stats)
+                line_count += 1
             
             self.log_message(LogLevel.DEBUG, f"Processed {line_count} lines from sockstat file")
             
-        except PermissionError as e:
-            raise RuntimeError(f"Permission denied reading {self.config.sockstat_path}") from e
-        except OSError as e:
-            raise RuntimeError(f"OS error reading {self.config.sockstat_path}: {str(e)}") from e
         except Exception as e:
             raise RuntimeError(f"Failed to read {self.config.sockstat_path}: {str(e)}") from e
 
@@ -297,7 +379,7 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
         
         return stats
 
-    def initialize_extended_stats(self, stats: Dict[str, Any]):
+    def initialize_extended_stats(self, stats: Dict[str, Any]) -> None:
         stats['unix'] = {
             'in_use': 0,
             'dynamic': 0,
@@ -321,7 +403,7 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
             'memory': 0
         }
 
-    def parse_sockstat_line(self, line: str, stats: Dict[str, Any]):
+    def parse_sockstat_line(self, line: str, stats: Dict[str, Any]) -> None:
         parts = line.split()
         if len(parts) < 2:
             self.log_message(LogLevel.DEBUG, f"Skipping malformed line: {line}")
@@ -334,125 +416,108 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
         else:
             self.log_message(LogLevel.DEBUG, f"Unknown section: {section}")
 
-    def parse_sockets_section(self, parts: List[str], stats: Dict[str, Any]):
+    def parse_sockets_section(self, parts: List[str], stats: Dict[str, Any]) -> None:
         if len(parts) >= 3:
             parsed_value = self.parse_int(parts[2])
             if parsed_value is not None:
                 stats['sockets_used'] = parsed_value
 
-    def load_extended_protocol_info(self, stats: Dict[str, Any]):
-        self.load_unix_sockets(stats)
-        self.load_netlink_sockets(stats)
-        self.load_packet_sockets(stats)
-        self.load_icmp_info(stats)
+    def load_extended_protocol_info(self, stats: Dict[str, Any]) -> None:
+        proc_files = [
+            ('unix', '/proc/net/unix', self.parse_unix_sockets),
+            ('netlink', '/proc/net/netlink', self.parse_count_file),
+            ('packet', '/proc/net/packet', self.parse_count_file),
+            ('icmp', '/proc/net/snmp', self.parse_icmp_snmp),
+            ('icmp6', '/proc/net/snmp', self.parse_icmp6_snmp)
+        ]
+        
+        for protocol, file_path, parser in proc_files:
+            if protocol in stats:
+                parser(file_path, stats, protocol)
+        
         self.load_additional_network_stats(stats)
 
-    def load_unix_sockets(self, stats: Dict[str, Any]):
-        unix_path = '/proc/net/unix'
-        if self.check_file_access(unix_path):
-            try:
-                with open(unix_path, 'r') as file:
-                    unix_count = 0
-                    file.readline()
-                    
-                    for line in file:
-                        if line.strip():
-                            unix_count += 1
-                    
-                    stats['unix']['in_use'] = unix_count
-                    
-            except Exception as e:
-                self.log_message(LogLevel.DEBUG, f"Could not read UNIX socket info: {str(e)}")
+    def parse_unix_sockets(self, file_path: str, stats: Dict[str, Any], protocol: str) -> None:
+        lines = self.read_file_lines(file_path)
+        if not lines:
+            return
+        
+        unix_count = 0
+        for i, line in enumerate(lines):
+            if i == 0:
+                continue
+            if line.strip():
+                unix_count += 1
+        
+        stats['unix']['in_use'] = unix_count
 
-    def load_netlink_sockets(self, stats: Dict[str, Any]):
-        netlink_path = '/proc/net/netlink'
-        if self.check_file_access(netlink_path):
-            try:
-                with open(netlink_path, 'r') as file:
-                    netlink_count = 0
-                    file.readline()
-                    
-                    for line in file:
-                        if line.strip():
-                            netlink_count += 1
-                    
-                    stats['netlink']['in_use'] = netlink_count
-                    
-            except Exception as e:
-                self.log_message(LogLevel.DEBUG, f"Could not read netlink socket info: {str(e)}")
+    def parse_count_file(self, file_path: str, stats: Dict[str, Any], protocol: str) -> None:
+        lines = self.read_file_lines(file_path)
+        if not lines:
+            return
+        
+        count = 0
+        for i, line in enumerate(lines):
+            if i == 0:
+                continue
+            if line.strip():
+                count += 1
+        
+        stats[protocol]['in_use'] = count
 
-    def load_packet_sockets(self, stats: Dict[str, Any]):
-        packet_path = '/proc/net/packet'
-        if self.check_file_access(packet_path):
-            try:
-                with open(packet_path, 'r') as file:
-                    packet_count = 0
-                    file.readline()
-                    
-                    for line in file:
-                        if line.strip():
-                            packet_count += 1
-                    
-                    stats['packet']['in_use'] = packet_count
-                    
-            except Exception as e:
-                self.log_message(LogLevel.DEBUG, f"Could not read packet socket info: {str(e)}")
+    def parse_icmp_snmp(self, file_path: str, stats: Dict[str, Any], protocol: str) -> None:
+        lines = self.read_file_lines(file_path)
+        if not lines:
+            return
+        
+        in_icmp_line = False
+        
+        for line in lines:
+            line = line.strip()
+            
+            if line.startswith('Icmp:'):
+                in_icmp_line = True
+                continue
+            
+            if in_icmp_line:
+                parts = line.split()
+                if parts:
+                    parsed_value = self.parse_int(parts[0])
+                    if parsed_value is not None:
+                        stats['icmp']['in_use'] = parsed_value
+                break
 
-    def load_icmp_info(self, stats: Dict[str, Any]):
-        snmp_path = '/proc/net/snmp'
-        if self.check_file_access(snmp_path):
-            try:
-                with open(snmp_path, 'r') as file:
-                    in_icmp_line = False
-                    in_icmp6_line = False
-                    
-                    for line in file:
-                        line = line.strip()
-                        
-                        if line.startswith('Icmp:'):
-                            in_icmp_line = True
-                            continue
-                        elif line.startswith('Icmp6:'):
-                            in_icmp6_line = True
-                            continue
-                        
-                        if in_icmp_line:
-                            parts = line.split()
-                            if parts:
-                                parsed_value = self.parse_int(parts[0])
-                                if parsed_value is not None:
-                                    stats['icmp']['in_use'] = parsed_value
-                            in_icmp_line = False
-                        
-                        if in_icmp6_line:
-                            parts = line.split()
-                            if parts:
-                                parsed_value = self.parse_int(parts[0])
-                                if parsed_value is not None:
-                                    stats['icmp6']['in_use'] = parsed_value
-                            in_icmp6_line = False
-                    
-            except Exception as e:
-                self.log_message(LogLevel.DEBUG, f"Could not read ICMP info: {str(e)}")
+    def parse_icmp6_snmp(self, file_path: str, stats: Dict[str, Any], protocol: str) -> None:
+        lines = self.read_file_lines(file_path)
+        if not lines:
+            return
+        
+        in_icmp6_line = False
+        
+        for line in lines:
+            line = line.strip()
+            
+            if line.startswith('Icmp6:'):
+                in_icmp6_line = True
+                continue
+            
+            if in_icmp6_line:
+                parts = line.split()
+                if parts:
+                    parsed_value = self.parse_int(parts[0])
+                    if parsed_value is not None:
+                        stats['icmp6']['in_use'] = parsed_value
+                break
 
-    def load_additional_network_stats(self, stats: Dict[str, Any]):
-        netstat_path = '/proc/net/netstat'
-        if self.check_file_access(netstat_path):
-            try:
-                with open(netstat_path, 'r') as file:
-                    for line in file:
-                        line = line.strip()
-                        if line.startswith('TcpExt:'):
-                            self.parse_tcp_extended_stats(line, stats)
-                    
-            except Exception as e:
-                self.log_message(LogLevel.DEBUG, f"Could not read extended network stats: {str(e)}")
+    def load_additional_network_stats(self, stats: Dict[str, Any]) -> None:
+        lines = self.read_file_lines('/proc/net/netstat')
+        
+        for line in lines:
+            line = line.strip()
+            if line.startswith('TcpExt:'):
+                self.parse_tcp_extended_stats(line, stats)
 
-    def check_file_access(self, file_path: str) -> bool:
-        path = Path(file_path)
-        return path.exists() and os.access(file_path, os.R_OK)
-
-    def parse_tcp_extended_stats(self, line: str, stats: Dict[str, Any]):
+    def parse_tcp_extended_stats(self, line: str, stats: Dict[str, Any]) -> None:
         parts = line.split()
         if len(parts) < 2:
             return
@@ -472,7 +537,10 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
                 stats['tcp_ext'][key] = parsed_value
 
     def parse_protocol_section(self, parts: List[str], stats: Dict[str, Any], 
-                              protocol: str, mapping: Dict[str, str]):
+                              protocol: str, mapping: Dict[str, str]) -> None:
+        if protocol not in stats:
+            stats[protocol] = {}
+        
         for i in range(1, len(parts), 2):
             if i + 1 >= len(parts):
                 break
@@ -494,7 +562,7 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
             self.log_message(LogLevel.WARNING, f"Failed to parse integer: '{value}'")
             return None
 
-    def display_stats(self, stats: Dict[str, Any]):
+    def display_stats(self, stats: Dict[str, Any]) -> None:
         output = self.generate_output(stats)
         
         if self.config.output_file:
@@ -533,17 +601,21 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
         
         protocols = [
             ('tcp', 'TCP'),
-            ('tcp6', 'TCP6'),
             ('udp', 'UDP'),
-            ('udp6', 'UDP6'),
             ('udp_lite', 'UDPLite'),
             ('raw', 'RAW'),
             ('frag', 'FRAG')
         ]
         
+        if self.config.extended:
+            protocols.extend([
+                ('tcp6', 'TCP6'),
+                ('udp6', 'UDP6')
+            ])
+        
         for protocol_key, protocol_name in protocols:
-            if protocol_key in stats:
-                has_values = any(value is not None for value in stats[protocol_key].values())
+            if protocol_key in stats and stats[protocol_key]:
+                has_values = any(v != 0 for v in stats[protocol_key].values())
                 if has_values:
                     lines.append(f"{protocol_name}:")
                     for key, value in stats[protocol_key].items():
@@ -572,9 +644,9 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
         ]
         
         for protocol_key, protocol_name in extended_protocols:
-            if protocol_key in stats:
-                in_use_value = stats[protocol_key].get('in_use')
-                if in_use_value is not None and in_use_value > 0:
+            if protocol_key in stats and stats[protocol_key]:
+                in_use_value = stats[protocol_key].get('in_use', 0)
+                if in_use_value > 0:
                     lines.append(f"{protocol_name}:")
                     for key, value in stats[protocol_key].items():
                         if value is not None:
@@ -591,12 +663,16 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
         
         return lines
 
-    def show_performance_metrics(self):
+    def show_performance_metrics(self) -> None:
         end_time = time.time()
         execution_time = round(end_time - self.start_time, 4)
         
-        memory_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        memory_mb = memory_kb / 1024.0
+        try:
+            memory_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            memory_mb = memory_kb / 1024.0
+        except AttributeError:
+            memory_kb = 0
+            memory_mb = 0.0
         
         metrics = {
             'performance': {
@@ -627,7 +703,7 @@ Note: The --quiet flag suppresses regular output but not JSON output or error me
         lines.append(f"Python version: {metrics['performance']['python_version']}")
         return '\n'.join(lines)
 
-def main():
+def main() -> None:
     if not sys.stdin.isatty() and len(sys.argv) == 1:
         print("This script must be run from the command line with arguments.", file=sys.stderr)
         sys.exit(1)
