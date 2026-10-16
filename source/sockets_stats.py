@@ -1,715 +1,1349 @@
+
 #!/usr/bin/env python3
 
-import os
-import sys
-import json
-import time
 import argparse
+import csv
 import datetime
+import io
+import json
+import os
 import resource
-from pathlib import Path
-from enum import Enum
-from typing import Dict, List, Any, Optional, Union, Callable
-from dataclasses import dataclass
+import signal
+import socket
+import sys
+import time
 
-class LogLevel(Enum):
-    DEBUG = 0
-    INFO = 1
-    WARNING = 2
-    ERROR = 3
+from collections import Counter, defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+VERSION = "2.0.0"
+
+TCP_STATES = {
+    "01": "ESTABLISHED",
+    "02": "SYN_SENT",
+    "03": "SYN_RECV",
+    "04": "FIN_WAIT1",
+    "05": "FIN_WAIT2",
+    "06": "TIME_WAIT",
+    "07": "CLOSE",
+    "08": "CLOSE_WAIT",
+    "09": "LAST_ACK",
+    "0A": "LISTEN",
+    "0B": "CLOSING",
+    "0C": "NEW_SYN_RECV",
+}
+
+SOCKET_TABLES = {
+    "tcp": ("net/tcp", "TCP", 4),
+    "tcp6": ("net/tcp6", "TCP", 6),
+    "udp": ("net/udp", "UDP", 4),
+    "udp6": ("net/udp6", "UDP", 6),
+    "udplite": ("net/udplite", "UDPLITE", 4),
+    "udplite6": ("net/udplite6", "UDPLITE", 6),
+    "raw": ("net/raw", "RAW", 4),
+    "raw6": ("net/raw6", "RAW", 6),
+}
+
+MEMORY_FIELDS = {"mem", "memory"}
+
+IMPORTANT_COUNTERS = {
+    "Tcp": [
+        "ActiveOpens",
+        "PassiveOpens",
+        "AttemptFails",
+        "EstabResets",
+        "InSegs",
+        "OutSegs",
+        "RetransSegs",
+        "InErrs",
+        "OutRsts",
+    ],
+    "Udp": [
+        "InDatagrams",
+        "NoPorts",
+        "InErrors",
+        "OutDatagrams",
+        "RcvbufErrors",
+        "SndbufErrors",
+    ],
+    "Ip": [
+        "InReceives",
+        "InDiscards",
+        "InDelivers",
+        "OutRequests",
+        "OutDiscards",
+    ],
+    "TcpExt": [
+        "ListenOverflows",
+        "ListenDrops",
+        "TCPTimeouts",
+        "TCPSynRetrans",
+        "TCPLossProbes",
+        "TCPBacklogDrop",
+        "TCPMemoryPressures",
+    ],
+}
+
+
+class SocketStatsError(Exception):
+    pass
+
 
 @dataclass
-class ToolConfig:
-    log_level: LogLevel = LogLevel.INFO
-    json_output: bool = False
-    show_performance: bool = False
-    quiet: bool = False
-    extended: bool = False
-    sockstat_path: str = '/proc/net/sockstat'
-    output_file: Optional[str] = None
+class Config:
+    proc_root: Path
+    output_format: str
+    output_file: str | None
+    extended: bool
+    processes: bool
+    process_limit: int
+    watch: bool
+    interval: float
+    count: int
+    performance: bool
+    quiet: bool
+    verbose: bool
+    threshold_tcp: int | None
+    threshold_established: int | None
+    threshold_timewait: int | None
+    threshold_orphan: int | None
+    threshold_retrans: float | None
+    max_file_bytes: int
 
-class SocketStatsTool:
-    def __init__(self) -> None:
-        self.config = ToolConfig()
-        self.start_time = time.time()
-        self.max_file_size = 10 * 1024 * 1024
-        self.max_line_length = 1024 * 1024
-        self.allowed_proc_dirs = [
-            Path('/proc/net').resolve(),
-            Path('/proc').resolve(),
-            Path('/tmp/socket-stats').resolve() if Path('/tmp/socket-stats').exists() else None
-        ]
-        self.allowed_proc_dirs = [d for d in self.allowed_proc_dirs if d is not None]
 
-        self.protocol_parsers: Dict[str, Callable] = {
-            'sockets:': self.parse_sockets_section,
-            'TCP:': lambda p, s: self.parse_protocol_section(p, s, 'tcp', {
-                'inuse': 'in_use', 'orphan': 'orphan', 'tw': 'time_wait', 
-                'alloc': 'allocated', 'mem': 'memory'
-            }),
-            'UDP:': lambda p, s: self.parse_protocol_section(p, s, 'udp', {
-                'inuse': 'in_use', 'mem': 'memory'
-            }),
-            'UDPLITE:': lambda p, s: self.parse_protocol_section(p, s, 'udp_lite', {
-                'inuse': 'in_use'
-            }),
-            'RAW:': lambda p, s: self.parse_protocol_section(p, s, 'raw', {
-                'inuse': 'in_use'
-            }),
-            'FRAG:': lambda p, s: self.parse_protocol_section(p, s, 'frag', {
-                'inuse': 'in_use', 'memory': 'memory'
-            }),
-            'TCP6:': lambda p, s: self.parse_protocol_section(p, s, 'tcp6', {
-                'inuse': 'in_use', 'orphan': 'orphan', 'tw': 'time_wait', 
-                'alloc': 'allocated', 'mem': 'memory'
-            }) if self.config.extended else None,
-            'UDP6:': lambda p, s: self.parse_protocol_section(p, s, 'udp6', {
-                'inuse': 'in_use', 'mem': 'memory'
-            }) if self.config.extended else None
-        }
-        
-        self.protocol_parsers = {k: v for k, v in self.protocol_parsers.items() if v is not None}
+class ProcReader:
+    def __init__(self, root: Path, max_bytes: int, verbose: bool):
+        self.root = root
+        self.max_bytes = max_bytes
+        self.verbose = verbose
+        self.warnings = []
 
-    def run(self) -> None:
-        exit_code = 0
+    def read(self, relative: str, optional: bool = True) -> list[str]:
+        path = self.root / relative
+
         try:
-            self.parse_command_line()
-            
-            if self.config.quiet and (self.config.json_output or self.config.show_performance):
-                self.log_message(LogLevel.WARNING, "--quiet flag is active, but output will still be generated for JSON and performance modes")
+            with path.open("r", encoding="utf-8", errors="replace") as stream:
+                lines = []
+                size = 0
 
-            self.validate_config()
-            self.check_sockstat_file()
-            
-            stats = self.get_socket_stats()
-            
-            if not self.config.quiet:
-                self.display_stats(stats)
+                for line in stream:
+                    size += len(line.encode("utf-8"))
 
-            if self.config.show_performance:
-                self.show_performance_metrics()
-            
-        except SystemExit:
-            raise
-        except Exception as e:
-            self.log_message(LogLevel.ERROR, str(e))
-            exit_code = 1
-        
-        sys.exit(exit_code)
+                    if size > self.max_bytes:
+                        raise SocketStatsError(
+                            f"Read limit exceeded: {path}"
+                        )
 
-    def parse_command_line(self) -> None:
-        parser = argparse.ArgumentParser(description='Socket Statistics Tool', add_help=False)
-        parser.add_argument('--json', action='store_true', help='Output socket summary in JSON format')
-        parser.add_argument('--log-level', type=str, help='Set log level (DEBUG, INFO, WARNING, ERROR)')
-        parser.add_argument('--help', action='store_true', help='Display help message')
-        parser.add_argument('--path', type=str, help='Path to sockstat file (default: /proc/net/sockstat)')
-        parser.add_argument('--performance', action='store_true', help='Show performance metrics')
-        parser.add_argument('--quiet', action='store_true', help='Suppress all non-error output')
-        parser.add_argument('--extended', action='store_true', help='Show extended protocol information')
-        parser.add_argument('--version', action='store_true', help='Display version information')
-        parser.add_argument('--output', type=str, help='Write output to specified file')
-        parser.add_argument('--verbose', action='store_true', help='Enable verbose output (same as --log-level DEBUG)')
-        
-        args = parser.parse_args()
-        
-        if args.json:
-            self.config.json_output = True
-        
-        if args.verbose:
-            self.config.log_level = LogLevel.DEBUG
-        elif args.log_level:
-            try:
-                self.config.log_level = LogLevel[args.log_level.upper()]
-            except KeyError:
-                valid_levels = ', '.join([level.name for level in LogLevel])
-                raise RuntimeError(f"Invalid log level: {args.log_level}. Valid levels: {valid_levels}")
-        
-        if args.help:
-            self.show_help()
-            sys.exit(0)
-        
-        if args.path:
-            self.config.sockstat_path = self.sanitize_path(args.path)
-        
-        if args.performance:
-            self.config.show_performance = True
-        
-        if args.quiet:
-            self.config.quiet = True
-        
-        if args.extended:
-            self.config.extended = True
-        
-        if args.output:
-            self.config.output_file = self.sanitize_path(args.output)
-        
-        if args.version:
-            if not args.quiet:
-                self.show_version()
-            sys.exit(0)
+                    lines.append(line.rstrip("\r\n"))
 
-    def sanitize_path(self, path: str) -> str:
-        path = path.replace('\0', '')
-        path = os.path.normpath(path)
-        
-        if '..' in path.split(os.sep):
-            raise RuntimeError("Path traversal detected in path")
-        
-        return path
+                return lines
 
-    def is_path_allowed(self, path: Path) -> bool:
+        except FileNotFoundError:
+            if not optional:
+                raise SocketStatsError(f"Required file missing: {path}")
+
+            if self.verbose:
+                self.warnings.append(f"Optional file missing: {path}")
+
+            return []
+
+        except PermissionError:
+            self.warnings.append(f"Permission denied: {path}")
+            return []
+
+        except OSError as exc:
+            self.warnings.append(f"Cannot read {path}: {exc}")
+            return []
+
+
+def parse_pairs(tokens: list[str]) -> dict[str, int]:
+    result = {}
+
+    for index in range(0, len(tokens) - 1, 2):
+        key = tokens[index]
+
         try:
-            resolved_path = path.resolve()
-        except (RuntimeError, OSError):
-            return False
-        
-        for allowed_dir in self.allowed_proc_dirs:
-            if allowed_dir in resolved_path.parents or resolved_path == allowed_dir:
-                return True
-        
-        return False
-
-    def validate_config(self) -> None:
-        if not isinstance(self.config.log_level, LogLevel):
-            raise RuntimeError(f"Invalid log level configuration")
-        
-        if '\0' in self.config.sockstat_path or '..' in self.config.sockstat_path.split(os.sep):
-            raise RuntimeError("Invalid path: potential path traversal attack detected")
-        
-        if self.config.output_file:
-            if '\0' in self.config.output_file or '..' in self.config.output_file.split(os.sep):
-                raise RuntimeError("Invalid output file path: potential path traversal attack detected")
-            
-            output_dir = Path(self.config.output_file).parent
-            if not output_dir.exists():
-                raise RuntimeError(f"Output directory does not exist: {output_dir}")
-            
-            if not os.access(str(output_dir), os.W_OK):
-                raise RuntimeError(f"Output directory is not writable: {output_dir}")
-
-    def check_sockstat_file(self) -> None:
-        path = Path(self.config.sockstat_path)
-        
-        if path.is_symlink():
-            real_path = path.resolve()
-            if not real_path.exists():
-                raise RuntimeError(f"Cannot resolve symbolic link: {self.config.sockstat_path}")
-            
-            if not self.is_path_allowed(real_path):
-                raise RuntimeError(f"Symbolic link target not allowed: {real_path}")
-            
-            self.config.sockstat_path = str(real_path)
-            path = real_path
-        
-        if not self.is_path_allowed(path):
-            raise RuntimeError(f"Path not allowed: {self.config.sockstat_path}")
-        
-        if not path.exists():
-            raise RuntimeError(
-                f"'{self.config.sockstat_path}' not found. "
-                "Ensure you are running on a Linux system or specify --path for an alternate file"
-            )
-        
-        if not os.access(str(path), os.R_OK):
-            raise RuntimeError(f"Cannot read '{self.config.sockstat_path}'")
-        
-        if path.is_dir():
-            raise RuntimeError(f"'{self.config.sockstat_path}' is a directory, expected a file")
-        
-        try:
-            file_size = path.stat().st_size
-            if file_size > self.max_file_size:
-                self.log_message(LogLevel.WARNING, f"File size {file_size} exceeds threshold {self.max_file_size}")
-        except OSError as e:
-            raise RuntimeError(f"Cannot access file stats: {str(e)}")
-
-    def safe_open_file(self, file_path: str, mode: str = 'r'):
-        path = Path(file_path)
-        
-        if not self.is_path_allowed(path):
-            raise RuntimeError(f"Path not allowed: {file_path}")
-        
-        if not path.exists():
-            return None
-        
-        if not os.access(str(path), os.R_OK):
-            return None
-        
-        try:
-            file_size = path.stat().st_size
-            if file_size > self.max_file_size:
-                self.log_message(LogLevel.WARNING, f"File size {file_size} exceeds threshold {self.max_file_size}")
-                return None
-        except OSError:
-            return None
-        
-        return open(str(path), mode)
-
-    def log_message(self, level: LogLevel, message: str) -> None:
-        if level.value < self.config.log_level.value:
-            return
-        
-        timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-        formatted_message = f'[{timestamp}] {level.name}: {message}'
-        
-        if level == LogLevel.ERROR:
-            print(formatted_message, file=sys.stderr)
-        elif not self.config.json_output:
-            print(formatted_message)
-
-    def show_version(self) -> None:
-        print("Socket Statistics Tool 1.2.0")
-        print(f"Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
-
-    def show_help(self) -> None:
-        help_text = """Socket Statistics Tool 1.2.0
-
-Usage: socket_stats.py [OPTIONS]
-
-Options:
-  --json                 Output socket summary in JSON format
-  --log-level LEVEL      Set log level (DEBUG, INFO, WARNING, ERROR)
-  --verbose              Enable verbose output (same as --log-level DEBUG)
-  --path PATH            Path to sockstat file (default: /proc/net/sockstat)
-  --performance          Show performance metrics
-  --quiet                Suppress all non-error output
-  --extended             Show extended protocol information
-  --output FILE          Write output to specified file
-  --version              Display version information
-  --help                 Display this help message
-
-Examples:
-  socket_stats.py --json
-  socket_stats.py --log-level DEBUG
-  socket_stats.py --json --log-level WARNING
-  socket_stats.py --path /tmp/test-sockstat --json
-  socket_stats.py --performance --json
-  socket_stats.py --quiet --json
-  socket_stats.py --extended --json --output results.json
-
-Note: The --quiet flag suppresses regular output but not JSON output or error messages.
-
-"""
-        print(help_text)
-
-    def read_file_lines(self, file_path: str) -> List[str]:
-        lines = []
-        file_obj = self.safe_open_file(file_path)
-        if not file_obj:
-            return lines
-        
-        try:
-            with file_obj as f:
-                for line in f:
-                    if len(line) > self.max_line_length:
-                        self.log_message(LogLevel.WARNING, f"Line exceeds maximum length in {file_path}, skipping")
-                        continue
-                    lines.append(line.rstrip('\n'))
-        except Exception as e:
-            self.log_message(LogLevel.DEBUG, f"Error reading {file_path}: {str(e)}")
-        
-        return lines
-
-    def get_socket_stats(self) -> Dict[str, Any]:
-        self.log_message(LogLevel.INFO, f"Reading socket statistics from {self.config.sockstat_path}")
-        
-        stats = {
-            'metadata': {
-                'source': self.config.sockstat_path,
-                'generated_at': datetime.datetime.now().isoformat(),
-                'hostname': os.uname().nodename if hasattr(os, 'uname') else 'unknown'
-            },
-            'sockets_used': 0,
-            'tcp': {
-                'in_use': 0,
-                'orphan': 0,
-                'time_wait': 0,
-                'allocated': 0,
-                'memory': 0
-            },
-            'udp': {
-                'in_use': 0,
-                'memory': 0
-            },
-            'udp_lite': {
-                'in_use': 0
-            },
-            'raw': {
-                'in_use': 0
-            },
-            'frag': {
-                'in_use': 0,
-                'memory': 0
-            }
-        }
-
-        if self.config.extended:
-            self.initialize_extended_stats(stats)
-            stats['tcp6'] = {
-                'in_use': 0,
-                'orphan': 0,
-                'time_wait': 0,
-                'allocated': 0,
-                'memory': 0
-            }
-            stats['udp6'] = {
-                'in_use': 0,
-                'memory': 0
-            }
-        
-        try:
-            lines = self.read_file_lines(self.config.sockstat_path)
-            line_count = 0
-            
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                self.parse_sockstat_line(line, stats)
-                line_count += 1
-            
-            self.log_message(LogLevel.DEBUG, f"Processed {line_count} lines from sockstat file")
-            
-        except Exception as e:
-            raise RuntimeError(f"Failed to read {self.config.sockstat_path}: {str(e)}") from e
-
-        if self.config.extended:
-            self.load_extended_protocol_info(stats)
-        
-        return stats
-
-    def initialize_extended_stats(self, stats: Dict[str, Any]) -> None:
-        stats['unix'] = {
-            'in_use': 0,
-            'dynamic': 0,
-            'inode': 0
-        }
-        
-        stats['icmp'] = {
-            'in_use': 0
-        }
-        
-        stats['icmp6'] = {
-            'in_use': 0
-        }
-        
-        stats['netlink'] = {
-            'in_use': 0
-        }
-        
-        stats['packet'] = {
-            'in_use': 0,
-            'memory': 0
-        }
-
-    def parse_sockstat_line(self, line: str, stats: Dict[str, Any]) -> None:
-        parts = line.split()
-        if len(parts) < 2:
-            self.log_message(LogLevel.DEBUG, f"Skipping malformed line: {line}")
-            return
-        
-        section = parts[0]
-        
-        if section in self.protocol_parsers:
-            self.protocol_parsers[section](parts, stats)
-        else:
-            self.log_message(LogLevel.DEBUG, f"Unknown section: {section}")
-
-    def parse_sockets_section(self, parts: List[str], stats: Dict[str, Any]) -> None:
-        if len(parts) >= 3:
-            parsed_value = self.parse_int(parts[2])
-            if parsed_value is not None:
-                stats['sockets_used'] = parsed_value
-
-    def load_extended_protocol_info(self, stats: Dict[str, Any]) -> None:
-        proc_files = [
-            ('unix', '/proc/net/unix', self.parse_unix_sockets),
-            ('netlink', '/proc/net/netlink', self.parse_count_file),
-            ('packet', '/proc/net/packet', self.parse_count_file),
-            ('icmp', '/proc/net/snmp', self.parse_icmp_snmp),
-            ('icmp6', '/proc/net/snmp', self.parse_icmp6_snmp)
-        ]
-        
-        for protocol, file_path, parser in proc_files:
-            if protocol in stats:
-                parser(file_path, stats, protocol)
-        
-        self.load_additional_network_stats(stats)
-
-    def parse_unix_sockets(self, file_path: str, stats: Dict[str, Any], protocol: str) -> None:
-        lines = self.read_file_lines(file_path)
-        if not lines:
-            return
-        
-        unix_count = 0
-        for i, line in enumerate(lines):
-            if i == 0:
-                continue
-            if line.strip():
-                unix_count += 1
-        
-        stats['unix']['in_use'] = unix_count
-
-    def parse_count_file(self, file_path: str, stats: Dict[str, Any], protocol: str) -> None:
-        lines = self.read_file_lines(file_path)
-        if not lines:
-            return
-        
-        count = 0
-        for i, line in enumerate(lines):
-            if i == 0:
-                continue
-            if line.strip():
-                count += 1
-        
-        stats[protocol]['in_use'] = count
-
-    def parse_icmp_snmp(self, file_path: str, stats: Dict[str, Any], protocol: str) -> None:
-        lines = self.read_file_lines(file_path)
-        if not lines:
-            return
-        
-        in_icmp_line = False
-        
-        for line in lines:
-            line = line.strip()
-            
-            if line.startswith('Icmp:'):
-                in_icmp_line = True
-                continue
-            
-            if in_icmp_line:
-                parts = line.split()
-                if parts:
-                    parsed_value = self.parse_int(parts[0])
-                    if parsed_value is not None:
-                        stats['icmp']['in_use'] = parsed_value
-                break
-
-    def parse_icmp6_snmp(self, file_path: str, stats: Dict[str, Any], protocol: str) -> None:
-        lines = self.read_file_lines(file_path)
-        if not lines:
-            return
-        
-        in_icmp6_line = False
-        
-        for line in lines:
-            line = line.strip()
-            
-            if line.startswith('Icmp6:'):
-                in_icmp6_line = True
-                continue
-            
-            if in_icmp6_line:
-                parts = line.split()
-                if parts:
-                    parsed_value = self.parse_int(parts[0])
-                    if parsed_value is not None:
-                        stats['icmp6']['in_use'] = parsed_value
-                break
-
-    def load_additional_network_stats(self, stats: Dict[str, Any]) -> None:
-        lines = self.read_file_lines('/proc/net/netstat')
-        
-        for line in lines:
-            line = line.strip()
-            if line.startswith('TcpExt:'):
-                self.parse_tcp_extended_stats(line, stats)
-
-    def parse_tcp_extended_stats(self, line: str, stats: Dict[str, Any]) -> None:
-        parts = line.split()
-        if len(parts) < 2:
-            return
-        
-        if 'tcp_ext' not in stats:
-            stats['tcp_ext'] = {}
-        
-        for i in range(1, len(parts), 2):
-            if i + 1 >= len(parts):
-                break
-            
-            key = parts[i]
-            value = parts[i + 1]
-            
-            parsed_value = self.parse_int(value)
-            if parsed_value is not None:
-                stats['tcp_ext'][key] = parsed_value
-
-    def parse_protocol_section(self, parts: List[str], stats: Dict[str, Any], 
-                              protocol: str, mapping: Dict[str, str]) -> None:
-        if protocol not in stats:
-            stats[protocol] = {}
-        
-        for i in range(1, len(parts), 2):
-            if i + 1 >= len(parts):
-                break
-            
-            key = parts[i]
-            value = parts[i + 1]
-            
-            if key in mapping:
-                parsed_value = self.parse_int(value)
-                if parsed_value is not None:
-                    stats[protocol][mapping[key]] = parsed_value
-            else:
-                self.log_message(LogLevel.DEBUG, f"Unknown {protocol} field: {key}")
-
-    def parse_int(self, value: str) -> Optional[int]:
-        try:
-            return int(value)
+            result[key] = int(tokens[index + 1])
         except ValueError:
-            self.log_message(LogLevel.WARNING, f"Failed to parse integer: '{value}'")
-            return None
+            continue
 
-    def display_stats(self, stats: Dict[str, Any]) -> None:
-        output = self.generate_output(stats)
-        
-        if self.config.output_file:
+    return result
+
+
+def parse_sockstat(lines: list[str]) -> dict[str, Any]:
+    result = {}
+
+    for line in lines:
+        parts = line.split()
+
+        if len(parts) < 3:
+            continue
+
+        section = parts[0].rstrip(":").lower()
+        result[section] = parse_pairs(parts[1:])
+
+    return result
+
+
+def parse_mib(lines: list[str]) -> dict[str, dict[str, int]]:
+    result = defaultdict(dict)
+    pending = {}
+
+    for line in lines:
+        parts = line.split()
+
+        if len(parts) < 2:
+            continue
+
+        section = parts[0].rstrip(":")
+        fields = parts[1:]
+
+        if section not in pending:
+            pending[section] = fields
+            continue
+
+        headers = pending.pop(section)
+
+        if len(headers) != len(fields):
+            continue
+
+        for key, value in zip(headers, fields):
             try:
-                with open(self.config.output_file, 'w') as f:
-                    f.write(output)
-                self.log_message(LogLevel.INFO, f"Output written to {self.config.output_file}")
-            except Exception as e:
-                raise RuntimeError(f"Failed to write output to {self.config.output_file}: {str(e)}")
-        elif not self.config.quiet:
-            print(output)
+                result[section][key] = int(value)
+            except ValueError:
+                continue
 
-    def generate_output(self, stats: Dict[str, Any]) -> str:
-        if self.config.json_output:
-            return self.generate_json_output(stats)
-        else:
-            return self.generate_human_readable_output(stats)
+    return dict(result)
 
-    def generate_json_output(self, stats: Dict[str, Any]) -> str:
+
+def decode_ipv4(value: str) -> str:
+    try:
+        return socket.inet_ntop(
+            socket.AF_INET,
+            bytes.fromhex(value)[::-1],
+        )
+    except (ValueError, OSError):
+        return value
+
+
+def decode_ipv6(value: str) -> str:
+    try:
+        raw = bytes.fromhex(value)
+
+        if len(raw) != 16:
+            return value
+
+        reordered = b"".join(
+            raw[index:index + 4][::-1]
+            for index in range(0, 16, 4)
+        )
+
+        return socket.inet_ntop(socket.AF_INET6, reordered)
+
+    except (ValueError, OSError):
+        return value
+
+
+def decode_endpoint(value: str, family: int) -> str:
+    try:
+        address, port_hex = value.rsplit(":", 1)
+        port = int(port_hex, 16)
+
+        if family == 6:
+            return f"[{decode_ipv6(address)}]:{port}"
+
+        return f"{decode_ipv4(address)}:{port}"
+
+    except (ValueError, IndexError):
+        return value
+
+
+def parse_inet_table(
+    lines: list[str],
+    protocol: str,
+    family: int,
+) -> dict[str, Any]:
+    states = Counter()
+    records = []
+    inodes = set()
+    total = 0
+
+    for line in lines[1:]:
+        parts = line.split()
+
+        if len(parts) < 10:
+            continue
+
+        total += 1
+
+        state_code = parts[3].upper()
+        state = TCP_STATES.get(state_code, state_code)
+
+        if protocol == "TCP":
+            states[state] += 1
+
         try:
-            return json.dumps(stats, indent=2, ensure_ascii=False)
-        except Exception as e:
-            raise RuntimeError(f'Failed to encode JSON: {str(e)}')
+            inode = int(parts[9])
+        except ValueError:
+            inode = 0
 
-    def generate_human_readable_output(self, stats: Dict[str, Any]) -> str:
-        lines = []
-        lines.append("Socket Statistics")
-        lines.append("=================")
-        lines.append(f"Generated: {stats['metadata']['generated_at']}")
-        lines.append(f"Hostname:  {stats['metadata']['hostname']}")
-        lines.append(f"Source:    {stats['metadata']['source']}")
-        lines.append("")
-        
-        lines.append(f"Sockets used: {stats['sockets_used']}")
-        lines.append("")
-        
-        protocols = [
-            ('tcp', 'TCP'),
-            ('udp', 'UDP'),
-            ('udp_lite', 'UDPLite'),
-            ('raw', 'RAW'),
-            ('frag', 'FRAG')
-        ]
-        
-        if self.config.extended:
-            protocols.extend([
-                ('tcp6', 'TCP6'),
-                ('udp6', 'UDP6')
-            ])
-        
-        for protocol_key, protocol_name in protocols:
-            if protocol_key in stats and stats[protocol_key]:
-                has_values = any(v != 0 for v in stats[protocol_key].values())
-                if has_values:
-                    lines.append(f"{protocol_name}:")
-                    for key, value in stats[protocol_key].items():
-                        if value is not None:
-                            display_key = key.replace('_', ' ').title()
-                            suffix = ' pages' if key == 'memory' else ''
-                            lines.append(f"  {display_key:<12} {value}{suffix}")
-                    lines.append("")
+        if inode:
+            inodes.add(inode)
 
-        if self.config.extended:
-            lines.extend(self.generate_extended_human_readable_output(stats))
-        
-        return '\n'.join(lines)
+        records.append({
+            "protocol": protocol,
+            "family": family,
+            "local": decode_endpoint(parts[1], family),
+            "remote": decode_endpoint(parts[2], family),
+            "state": state if protocol == "TCP" else state_code,
+            "inode": inode,
+        })
 
-    def generate_extended_human_readable_output(self, stats: Dict[str, Any]) -> List[str]:
-        lines = []
-        lines.append("Extended Protocol Information:")
-        lines.append("=============================")
-        
-        extended_protocols = [
-            ('unix', 'UNIX'),
-            ('netlink', 'Netlink'),
-            ('packet', 'Packet'), 
-            ('icmp', 'ICMP'),
-            ('icmp6', 'ICMP6')
-        ]
-        
-        for protocol_key, protocol_name in extended_protocols:
-            if protocol_key in stats and stats[protocol_key]:
-                in_use_value = stats[protocol_key].get('in_use', 0)
-                if in_use_value > 0:
-                    lines.append(f"{protocol_name}:")
-                    for key, value in stats[protocol_key].items():
-                        if value is not None:
-                            lines.append(f"  {key.replace('_', ' ').title():<12} {value}")
-                    lines.append("")
-        
-        if 'tcp_ext' in stats and stats['tcp_ext']:
-            lines.append("TCP Extended Statistics:")
-            lines.append("-----------------------")
-            for key, value in stats['tcp_ext'].items():
-                if value is not None:
-                    lines.append(f"  {key:<20} {value}")
-            lines.append("")
-        
-        return lines
+    return {
+        "count": total,
+        "states": dict(sorted(states.items())),
+        "inodes": inodes,
+        "records": records,
+    }
 
-    def show_performance_metrics(self) -> None:
-        end_time = time.time()
-        execution_time = round(end_time - self.start_time, 4)
-        
+
+def parse_unix(lines: list[str]) -> dict[str, Any]:
+    types = Counter()
+    states = Counter()
+    paths = Counter()
+    inodes = set()
+    count = 0
+
+    type_names = {
+        "0001": "STREAM",
+        "0002": "DGRAM",
+        "0005": "SEQPACKET",
+    }
+
+    state_names = {
+        "01": "UNCONNECTED",
+        "02": "CONNECTING",
+        "03": "CONNECTED",
+        "04": "DISCONNECTING",
+    }
+
+    for line in lines[1:]:
+        parts = line.split(maxsplit=7)
+
+        if len(parts) < 7:
+            continue
+
+        count += 1
+
+        sock_type = type_names.get(parts[4], parts[4])
+        state = state_names.get(parts[5], parts[5])
+
+        types[sock_type] += 1
+        states[state] += 1
+
         try:
-            memory_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            memory_mb = memory_kb / 1024.0
-        except AttributeError:
-            memory_kb = 0
-            memory_mb = 0.0
-        
-        metrics = {
-            'performance': {
-                'execution_time_seconds': execution_time,
-                'peak_memory_mb': round(memory_mb, 2),
-                'peak_memory_kb': memory_kb,
-                'python_version': f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-            }
+            inode = int(parts[6])
+            inodes.add(inode)
+        except ValueError:
+            pass
+
+        if len(parts) > 7:
+            paths[parts[7]] += 1
+
+    return {
+        "count": count,
+        "types": dict(sorted(types.items())),
+        "states": dict(sorted(states.items())),
+        "named_paths": sum(paths.values()),
+        "inodes": inodes,
+    }
+
+
+def count_table(lines: list[str]) -> int:
+    if not lines:
+        return 0
+
+    return sum(1 for line in lines[1:] if line.strip())
+
+
+def get_process_name(root: Path, pid: int) -> str:
+    path = root / str(pid) / "comm"
+
+    try:
+        return path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        ).strip()
+    except OSError:
+        return "unknown"
+
+
+def discover_owners(
+    root: Path,
+    target_inodes: set[int],
+    limit: int,
+) -> dict[str, Any]:
+    owners = defaultdict(set)
+    scanned = 0
+    inaccessible = 0
+
+    try:
+        entries = list(root.iterdir())
+    except OSError as exc:
+        raise SocketStatsError(
+            f"Cannot enumerate processes: {exc}"
+        ) from exc
+
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+
+        pid = int(entry.name)
+        fd_path = entry / "fd"
+
+        try:
+            descriptors = list(fd_path.iterdir())
+        except OSError:
+            inaccessible += 1
+            continue
+
+        scanned += 1
+
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+            except OSError:
+                continue
+
+            if not target.startswith("socket:["):
+                continue
+
+            try:
+                inode = int(target[8:-1])
+            except ValueError:
+                continue
+
+            if inode in target_inodes:
+                owners[inode].add(pid)
+
+    process_counts = Counter()
+    process_names = {}
+
+    for pids in owners.values():
+        for pid in pids:
+            process_counts[pid] += 1
+
+            if pid not in process_names:
+                process_names[pid] = get_process_name(root, pid)
+
+    processes = []
+
+    for pid, count in process_counts.most_common(limit):
+        processes.append({
+            "pid": pid,
+            "name": process_names[pid],
+            "sockets": count,
+        })
+
+    return {
+        "scanned_processes": scanned,
+        "inaccessible_processes": inaccessible,
+        "matched_inodes": len(owners),
+        "processes": processes,
+        "note": (
+            "Socket ownership may be incomplete without "
+            "permission to inspect other processes."
+        ),
+    }
+
+
+def flatten_numeric(
+    data: Any,
+    prefix: str = "",
+) -> dict[str, int | float]:
+    result = {}
+
+    if not isinstance(data, dict):
+        return result
+
+    for key, value in data.items():
+        path = f"{prefix}.{key}" if prefix else key
+
+        if isinstance(value, dict):
+            result.update(flatten_numeric(value, path))
+
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            result[path] = value
+
+    return result
+
+
+def calculate_changes(
+    current: dict[str, Any],
+    previous: dict[str, Any],
+    elapsed: float,
+) -> dict[str, Any]:
+    current_gauges = flatten_numeric(current.get("summary", {}))
+    previous_gauges = flatten_numeric(previous.get("summary", {}))
+
+    current_counters = flatten_numeric(current.get("counters", {}))
+    previous_counters = flatten_numeric(previous.get("counters", {}))
+
+    changes = {}
+    rates = {}
+
+    for key, value in current_gauges.items():
+        if key in previous_gauges:
+            difference = value - previous_gauges[key]
+
+            if difference:
+                changes[key] = difference
+
+    for key, value in current_counters.items():
+        if key not in previous_counters:
+            continue
+
+        difference = value - previous_counters[key]
+
+        if difference < 0:
+            continue
+
+        if difference:
+            changes[key] = difference
+
+        if elapsed > 0:
+            rates[key] = round(difference / elapsed, 3)
+
+    return {
+        "elapsed_seconds": round(elapsed, 3),
+        "changes": changes,
+        "counter_rates_per_second": rates,
+    }
+
+
+class SocketCollector:
+    def __init__(self, config: Config):
+        self.config = config
+
+    def collect(self) -> dict[str, Any]:
+        reader = ProcReader(
+            self.config.proc_root,
+            self.config.max_file_bytes,
+            self.config.verbose,
+        )
+
+        started = time.perf_counter()
+
+        sockstat4 = parse_sockstat(
+            reader.read("net/sockstat", optional=False)
+        )
+
+        sockstat6 = parse_sockstat(
+            reader.read("net/sockstat6")
+        )
+
+        summary = {
+            "sockets_used": sockstat4.get("sockets", {}).get("used", 0),
+            "tcp": sockstat4.get("tcp", {}),
+            "udp": sockstat4.get("udp", {}),
+            "udplite": sockstat4.get("udplite", {}),
+            "raw": sockstat4.get("raw", {}),
+            "frag": sockstat4.get("frag", {}),
         }
-        
-        if self.config.json_output:
-            output = json.dumps(metrics, indent=2, ensure_ascii=False)
-        else:
-            output = self.generate_performance_human_readable(metrics)
-        
-        if self.config.output_file and self.config.json_output:
-            self.log_message(LogLevel.INFO, "Performance metrics are included in the main JSON output")
-        elif not self.config.quiet:
-            print(output)
 
-    def generate_performance_human_readable(self, metrics: Dict[str, Any]) -> str:
-        lines = []
+        if self.config.extended:
+            summary["ipv6"] = sockstat6
+
+        tables = {}
+        all_inodes = set()
+        tcp_states = Counter()
+
+        for name, (path, protocol, family) in SOCKET_TABLES.items():
+            if family == 6 and not self.config.extended:
+                continue
+
+            lines = reader.read(path)
+
+            table = parse_inet_table(
+                lines,
+                protocol,
+                family,
+            )
+
+            all_inodes.update(table["inodes"])
+            tcp_states.update(table["states"])
+
+            tables[name] = {
+                "count": table["count"],
+                "states": table["states"],
+            }
+
+        unix_data = parse_unix(
+            reader.read("net/unix")
+        )
+
+        all_inodes.update(unix_data["inodes"])
+
+        summary["unix"] = {
+            "count": unix_data["count"],
+            "types": unix_data["types"],
+            "states": unix_data["states"],
+            "named_paths": unix_data["named_paths"],
+        }
+
+        summary["netlink"] = {
+            "count": count_table(reader.read("net/netlink"))
+        }
+
+        summary["packet"] = {
+            "count": count_table(reader.read("net/packet"))
+        }
+
+        summary["tcp_states"] = dict(sorted(tcp_states.items()))
+
+        summary["table_counts"] = {
+            name: table["count"]
+            for name, table in tables.items()
+        }
+
+        snmp = parse_mib(
+            reader.read("net/snmp")
+        )
+
+        netstat = parse_mib(
+            reader.read("net/netstat")
+        )
+
+        snmp6 = {}
+
+        if self.config.extended:
+            for line in reader.read("net/snmp6"):
+                parts = line.split()
+
+                if len(parts) != 2:
+                    continue
+
+                try:
+                    snmp6[parts[0]] = int(parts[1])
+                except ValueError:
+                    continue
+
+        counters = {}
+
+        for source in (snmp, netstat):
+            for section, fields in source.items():
+                counters.setdefault(section, {}).update(fields)
+
+        if snmp6:
+            counters["IPv6"] = snmp6
+
+        result = {
+            "metadata": {
+                "version": VERSION,
+                "hostname": socket.gethostname(),
+                "timestamp": datetime.datetime.now(
+                    datetime.timezone.utc
+                ).isoformat(),
+                "proc_root": str(self.config.proc_root),
+                "pid": os.getpid(),
+            },
+            "summary": summary,
+            "tables": tables,
+            "counters": counters,
+            "warnings": reader.warnings,
+        }
+
+        if self.config.processes:
+            try:
+                result["ownership"] = discover_owners(
+                    self.config.proc_root,
+                    all_inodes,
+                    self.config.process_limit,
+                )
+            except SocketStatsError as exc:
+                result["warnings"].append(str(exc))
+
+        self.evaluate_thresholds(result)
+
+        if self.config.performance:
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+
+            result["performance"] = {
+                "collection_seconds": round(
+                    time.perf_counter() - started, 6
+                ),
+                "peak_memory_mb": round(
+                    usage.ru_maxrss / 1024, 2
+                ),
+                "user_cpu_seconds": round(usage.ru_utime, 4),
+                "system_cpu_seconds": round(usage.ru_stime, 4),
+            }
+
+        return result
+
+    def evaluate_thresholds(self, result: dict[str, Any]) -> None:
+        summary = result["summary"]
+        warnings = result["warnings"]
+
+        tcp = summary.get("tcp", {})
+        states = summary.get("tcp_states", {})
+
+        checks = [
+            (
+                "TCP allocated",
+                tcp.get("alloc", 0),
+                self.config.threshold_tcp,
+            ),
+            (
+                "TCP established",
+                states.get("ESTABLISHED", 0),
+                self.config.threshold_established,
+            ),
+            (
+                "TCP time-wait",
+                states.get("TIME_WAIT", 0),
+                self.config.threshold_timewait,
+            ),
+            (
+                "TCP orphan",
+                tcp.get("orphan", 0),
+                self.config.threshold_orphan,
+            ),
+        ]
+
+        for label, value, threshold in checks:
+            if threshold is not None and value >= threshold:
+                warnings.append(
+                    f"{label} threshold reached: "
+                    f"{value} >= {threshold}"
+                )
+
+        threshold = self.config.threshold_retrans
+
+        if threshold is not None:
+            tcp_counters = result["counters"].get("Tcp", {})
+            outgoing = tcp_counters.get("OutSegs", 0)
+            retrans = tcp_counters.get("RetransSegs", 0)
+
+            if outgoing > 0:
+                ratio = retrans / outgoing * 100
+
+                if ratio >= threshold:
+                    warnings.append(
+                        "Cumulative TCP retransmission ratio "
+                        f"{ratio:.2f}% >= {threshold:.2f}%"
+                    )
+
+
+def format_number(value: Any) -> str:
+    if isinstance(value, float):
+        return f"{value:,.3f}"
+
+    if isinstance(value, int):
+        return f"{value:,}"
+
+    return str(value)
+
+
+def format_table(
+    rows: list[tuple[str, Any]],
+    width: int = 28,
+) -> list[str]:
+    return [
+        f"  {label:<{width}} {format_number(value)}"
+        for label, value in rows
+    ]
+
+
+def format_human(data: dict[str, Any], config: Config) -> str:
+    metadata = data["metadata"]
+    summary = data["summary"]
+    lines = []
+
+    lines.append("SOCKET STATISTICS")
+    lines.append("=" * 72)
+    lines.append(f"Host:       {metadata['hostname']}")
+    lines.append(f"Timestamp:  {metadata['timestamp']}")
+    lines.append(f"Source:     {metadata['proc_root']}")
+    lines.append(f"Version:    {metadata['version']}")
+    lines.append("")
+
+    lines.append("SOCKET SUMMARY")
+    lines.append("-" * 72)
+
+    rows = [
+        ("Sockets used", summary.get("sockets_used", 0)),
+        ("TCP allocated", summary.get("tcp", {}).get("alloc", 0)),
+        ("TCP in use", summary.get("tcp", {}).get("inuse", 0)),
+        ("TCP orphan", summary.get("tcp", {}).get("orphan", 0)),
+        ("TCP time-wait", summary.get("tcp", {}).get("tw", 0)),
+        ("UDP in use", summary.get("udp", {}).get("inuse", 0)),
+        ("RAW in use", summary.get("raw", {}).get("inuse", 0)),
+        ("UNIX sockets", summary.get("unix", {}).get("count", 0)),
+        ("Netlink sockets", summary.get("netlink", {}).get("count", 0)),
+        ("Packet sockets", summary.get("packet", {}).get("count", 0)),
+    ]
+
+    lines.extend(format_table(rows))
+    lines.append("")
+
+    lines.append("SOCKET MEMORY")
+    lines.append("-" * 72)
+
+    memory_rows = []
+
+    for protocol in ("tcp", "udp", "frag"):
+        fields = summary.get(protocol, {})
+
+        for field in MEMORY_FIELDS:
+            if field in fields:
+                memory_rows.append((
+                    f"{protocol.upper()} {field} (pages)",
+                    fields[field],
+                ))
+
+    if memory_rows:
+        lines.extend(format_table(memory_rows))
+    else:
+        lines.append("  No memory counters available")
+
+    lines.append("")
+    lines.append("TCP CONNECTION STATES")
+    lines.append("-" * 72)
+
+    states = summary.get("tcp_states", {})
+
+    if states:
+        lines.extend(
+            format_table(
+                sorted(
+                    states.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            )
+        )
+    else:
+        lines.append("  No TCP entries found")
+
+    lines.append("")
+    lines.append("PROTOCOL TABLES")
+    lines.append("-" * 72)
+
+    lines.extend(
+        format_table(
+            sorted(summary.get("table_counts", {}).items())
+        )
+    )
+
+    if config.extended:
         lines.append("")
-        lines.append("Performance Metrics:")
-        lines.append("===================")
-        lines.append(f"Execution time: {metrics['performance']['execution_time_seconds']}s")
-        lines.append(f"Peak memory:    {metrics['performance']['peak_memory_mb']} MB")
-        lines.append(f"Python version: {metrics['performance']['python_version']}")
-        return '\n'.join(lines)
+        lines.append("IPV6 SOCKET STATISTICS")
+        lines.append("-" * 72)
 
-def main() -> None:
-    if not sys.stdin.isatty() and len(sys.argv) == 1:
-        print("This script must be run from the command line with arguments.", file=sys.stderr)
-        sys.exit(1)
-    
-    app = SocketStatsTool()
-    app.run()
+        ipv6_rows = []
 
-if __name__ == '__main__':
-    main()
+        for protocol, fields in summary.get("ipv6", {}).items():
+            for key, value in fields.items():
+                ipv6_rows.append(
+                    (f"{protocol.upper()} {key}", value)
+                )
+
+        if ipv6_rows:
+            lines.extend(format_table(ipv6_rows))
+        else:
+            lines.append("  No IPv6 statistics available")
+
+        lines.append("")
+        lines.append("UNIX SOCKET TYPES")
+        lines.append("-" * 72)
+
+        lines.extend(
+            format_table(
+                sorted(summary["unix"]["types"].items())
+            )
+        )
+
+        lines.append("")
+        lines.append("KERNEL NETWORK COUNTERS")
+        lines.append("-" * 72)
+
+        for section, keys in IMPORTANT_COUNTERS.items():
+            counters = data["counters"].get(section, {})
+
+            selected = [
+                (f"{section}.{key}", counters[key])
+                for key in keys
+                if key in counters
+            ]
+
+            if selected:
+                lines.extend(format_table(selected))
+
+    if "ownership" in data:
+        ownership = data["ownership"]
+
+        lines.append("")
+        lines.append("SOCKET OWNERSHIP")
+        lines.append("-" * 72)
+
+        lines.extend(format_table([
+            ("Processes scanned", ownership["scanned_processes"]),
+            ("Processes inaccessible", ownership["inaccessible_processes"]),
+            ("Matched socket inodes", ownership["matched_inodes"]),
+        ]))
+
+        lines.append("")
+        lines.append(
+            f"  {'PID':>8}  {'SOCKETS':>10}  PROCESS"
+        )
+
+        for process in ownership["processes"]:
+            lines.append(
+                f"  {process['pid']:>8}  "
+                f"{process['sockets']:>10}  "
+                f"{process['name']}"
+            )
+
+    if "sampling" in data:
+        sampling = data["sampling"]
+
+        lines.append("")
+        lines.append("CHANGES SINCE PREVIOUS SAMPLE")
+        lines.append("-" * 72)
+
+        lines.append(
+            f"  Interval: {sampling['elapsed_seconds']:.3f} seconds"
+        )
+
+        changes = sampling.get("changes", {})
+
+        for key, value in sorted(changes.items()):
+            lines.append(f"  {key:<42} {value:+,}")
+
+        rates = sampling.get("counter_rates_per_second", {})
+
+        if rates:
+            lines.append("")
+            lines.append("COUNTER RATES PER SECOND")
+            lines.append("-" * 72)
+
+            for key, value in sorted(rates.items()):
+                if value:
+                    lines.append(f"  {key:<42} {value:,.3f}/s")
+
+    if "performance" in data:
+        lines.append("")
+        lines.append("PERFORMANCE")
+        lines.append("-" * 72)
+
+        lines.extend(
+            format_table(
+                list(data["performance"].items())
+            )
+        )
+
+    if data.get("warnings"):
+        lines.append("")
+        lines.append("WARNINGS")
+        lines.append("-" * 72)
+
+        for warning in data["warnings"]:
+            lines.append(f"  {warning}")
+
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def flatten_csv(data: dict[str, Any]) -> str:
+    flattened = {}
+
+    for section in ("summary", "counters", "performance"):
+        flattened.update(
+            flatten_numeric(data.get(section, {}), section)
+        )
+
+    flattened["timestamp"] = data["metadata"]["timestamp"]
+    flattened["hostname"] = data["metadata"]["hostname"]
+
+    if "sampling" in data:
+        flattened.update(
+            flatten_numeric(data["sampling"], "sampling")
+        )
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+
+    writer.writerow(flattened.keys())
+    writer.writerow(flattened.values())
+
+    return buffer.getvalue().rstrip("\n")
+
+
+class OutputManager:
+    def __init__(self, config: Config):
+        self.config = config
+        self.first_sample = True
+
+        if config.output_file:
+            self.stream = open(
+                config.output_file,
+                "w",
+                encoding="utf-8",
+                newline="",
+            )
+            self.owns_stream = True
+        else:
+            self.stream = sys.stdout
+            self.owns_stream = False
+
+    def emit(self, data: dict[str, Any]) -> None:
+        if self.config.quiet:
+            return
+
+        if self.config.output_format == "json":
+            content = json.dumps(
+                data,
+                indent=None if self.config.watch else 2,
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+
+        elif self.config.output_format == "csv":
+            content = flatten_csv(data)
+
+            if not self.first_sample:
+                content = "\n".join(content.splitlines()[1:])
+
+        else:
+            content = format_human(data, self.config)
+
+            if not self.first_sample:
+                content = "\n" + content
+
+        self.stream.write(content + "\n")
+        self.stream.flush()
+
+        self.first_sample = False
+
+    def close(self) -> None:
+        if self.owns_stream:
+            self.stream.close()
+
+
+class Application:
+    def __init__(self, config: Config):
+        self.config = config
+        self.collector = SocketCollector(config)
+        self.running = True
+
+    def stop(self, signum, frame) -> None:
+        self.running = False
+
+    def run(self) -> int:
+        signal.signal(signal.SIGINT, self.stop)
+        signal.signal(signal.SIGTERM, self.stop)
+
+        output = OutputManager(self.config)
+
+        previous = None
+        previous_time = None
+        completed = 0
+
+        try:
+            while self.running:
+                started = time.monotonic()
+                data = self.collector.collect()
+
+                if previous is not None and previous_time is not None:
+                    elapsed = started - previous_time
+
+                    data["sampling"] = calculate_changes(
+                        data,
+                        previous,
+                        elapsed,
+                    )
+
+                output.emit(data)
+
+                previous = data
+                previous_time = started
+                completed += 1
+
+                if not self.config.watch:
+                    break
+
+                if self.config.count and completed >= self.config.count:
+                    break
+
+                remaining = self.config.interval - (
+                    time.monotonic() - started
+                )
+
+                deadline = time.monotonic() + max(remaining, 0)
+
+                while self.running:
+                    wait = deadline - time.monotonic()
+
+                    if wait <= 0:
+                        break
+
+                    time.sleep(min(wait, 0.2))
+
+        finally:
+            output.close()
+
+        return 0
+
+
+def nonnegative_int(value: str) -> int:
+    try:
+        result = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Expected an integer"
+        ) from exc
+
+    if result < 0:
+        raise argparse.ArgumentTypeError(
+            "Value cannot be negative"
+        )
+
+    return result
+
+
+def positive_float(value: str) -> float:
+    try:
+        result = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Expected a number"
+        ) from exc
+
+    if not 0 < result < float("inf"):
+        raise argparse.ArgumentTypeError(
+            "Value must be finite and greater than zero"
+        )
+
+    return result
+
+
+def parse_arguments() -> Config:
+    parser = argparse.ArgumentParser(
+        prog="sockets_stat.py",
+        description=(
+            "Linux socket statistics and network diagnostics "
+            "using the proc filesystem."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"Socket Statistics Tool {VERSION}",
+    )
+
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON",
+    )
+
+    parser.add_argument(
+        "--csv",
+        action="store_true",
+        help="Output CSV",
+    )
+
+    parser.add_argument(
+        "--extended",
+        action="store_true",
+        help="Include IPv6 and extended network counters",
+    )
+
+    parser.add_argument(
+        "--processes",
+        action="store_true",
+        help="Discover socket ownership by process",
+    )
+
+    parser.add_argument(
+        "--process-limit",
+        type=nonnegative_int,
+        default=20,
+        help="Maximum number of processes to display",
+    )
+
+    parser.add_argument(
+        "--watch",
+        action="store_true",
+        help="Collect socket statistics repeatedly",
+    )
+
+    parser.add_argument(
+        "--interval",
+        type=positive_float,
+        default=2.0,
+        help="Seconds between samples",
+    )
+
+    parser.add_argument(
+        "--count",
+        type=nonnegative_int,
+        default=0,
+        help="Number of samples in watch mode; zero means unlimited",
+    )
+
+    parser.add_argument(
+        "--proc-root",
+        default="/proc",
+        help="Root of the proc filesystem",
+    )
+
+    parser.add_argument(
+        "--path",
+        default=None,
+        help="Alternative sockstat file path",
+    )
+
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Write output to a file",
+    )
+
+    parser.add_argument(
+        "--performance",
+        action="store_true",
+        help="Include performance metrics",
+    )
+
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress normal output",
+    )
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Report missing optional proc files",
+    )
+
+    parser.add_argument(
+        "--threshold-tcp",
+        type=nonnegative_int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--threshold-established",
+        type=nonnegative_int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--threshold-timewait",
+        type=nonnegative_int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--threshold-orphan",
+        type=nonnegative_int,
+        default=None,
+    )
+
+    parser.add_argument(
+        "--threshold-retrans",
+        type=float,
+        default=None,
+        help="Cumulative retransmission percentage threshold",
+    )
+
+    parser.add_argument(
+        "--max-file-bytes",
+        type=nonnegative_int,
+        default=32 * 1024 * 1024,
+        help="Maximum bytes to read from each proc file",
+    )
+
+    args = parser.parse_args()
+
+    if args.json and args.csv:
+        parser.error("--json and --csv cannot be combined")
+
+    if args.threshold_retrans is not None:
+        if not 0 <= args.threshold_retrans <= 100:
+            parser.error(
+                "--threshold-retrans must be between 0 and 100"
+            )
+
+    if args.max_file_bytes == 0:
+        parser.error("--max-file-bytes must be greater than zero")
+
+    root = Path(args.proc_root).expanduser().resolve()
+
+    if args.path:
+        sockstat = Path(args.path).expanduser().resolve()
+
+        if sockstat.name != "sockstat":
+            parser.error("--path must point to a sockstat file")
+
+        if sockstat.parent.name != "net":
+            parser.error("--path must point to a net/sockstat file")
+
+        root = sockstat.parent.parent
+
+    if not root.is_dir():
+        parser.error(f"Proc root is not a directory: {root}")
+
+    output_format = "human"
+
+    if args.json:
+        output_format = "json"
+    elif args.csv:
+        output_format = "csv"
+
+    return Config(
+        proc_root=root,
+        output_format=output_format,
+        output_file=args.output,
+        extended=args.extended,
+        processes=args.processes,
+        process_limit=args.process_limit,
+        watch=args.watch,
+        interval=args.interval,
+        count=args.count,
+        performance=args.performance,
+        quiet=args.quiet,
+        verbose=args.verbose,
+        threshold_tcp=args.threshold_tcp,
+        threshold_established=args.threshold_established,
+        threshold_timewait=args.threshold_timewait,
+        threshold_orphan=args.threshold_orphan,
+        threshold_retrans=args.threshold_retrans,
+        max_file_bytes=args.max_file_bytes,
+    )
+
+
+def main() -> int:
+    try:
+        config = parse_arguments()
+        application = Application(config)
+        return application.run()
+
+    except BrokenPipeError:
+        return 0
+
+    except (SocketStatsError, OSError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
